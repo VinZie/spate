@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Spate</title>
+  <link rel="stylesheet" href="ui.css">
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <header>
+    <img src="../icons/icon-32.png" width="22" height="22" alt="">
+    <h1>Spate</h1>
+    <label class="switch" title="Send matching browser downloads to Spate">
+      <span>Capture downloads</span>
+      <input type="checkbox" id="enabled">
+    </label>
+  </header>
+
+  <section id="status" class="status" aria-live="polite">
+    <span class="dot"></span>
+    <div id="status-text" class="grow">Checking connection to Spate…</div>
+  </section>
+
+  <section id="permission" class="banner info hidden">
+    <div class="grow">Spate needs access to websites to read cookies and detect videos.</div>
+    <button id="grant" class="primary">Allow</button>
+  </section>
+
+  <section id="error" class="banner hidden">
+    <div class="grow" id="error-text"></div>
+    <button id="error-dismiss" class="link" title="Dismiss">Dismiss</button>
+  </section>
+
+  <section class="media">
+    <div class="media-head">
+      <h2>Detected media <span id="media-count" class="muted"></span></h2>
+      <button id="clear-media" class="link hidden">Clear</button>
+    </div>
+    <ul id="media-list"></ul>
+    <p id="media-empty" class="muted">No video or audio detected on this page yet. Start playback, then open this popup again.</p>
+  </section>
+
+  <footer>
+    <button id="download-links">Download all links</button>
+    <span id="action-result" class="muted grow" aria-live="polite"></span>
+    <button id="open-options" class="link">Options</button>
+  </footer>
+
+  <template id="media-row">
+    <li>
+      <span class="tag"></span>
+      <div class="info">
+        <div class="name"></div>
+        <div class="meta muted"></div>
+      </div>
+      <button class="download primary">Download</button>
+    </li>
+  </template>
+
+  <script type="module" src="popup.js"></script>
+</body>
+</html>

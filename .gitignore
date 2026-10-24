@@ -1,0 +1,16 @@
+/target/
+**/*.rs.bk
+
+# Executables are built, never committed
+*.exe
+
+# Packaged builds (packaging/package-windows.ps1)
+/dist/
+
+# Build outputs of the browser extension
+/extension/dist/
+/extension/node_modules/
+
+# Partial downloads produced by tests or manual runs
+*.part
+*.part.json

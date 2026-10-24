@@ -1,0 +1,34 @@
+[package]
+name = "spate-core"
+version = "0.1.0"
+edition = "2024"
+description = "Spate download engine, manager, persistence and IPC"
+license = "MIT"
+
+[dependencies]
+aes = "0.9.3"
+bytes = "1.12.1"
+cbc = "0.2.1"
+directories = "6.0.0"
+futures-util = "0.3.34"
+getrandom = "0.4.3"
+hex = "0.4.3"
+parking_lot = "0.13.0"
+percent-encoding = "2.3.2"
+reqwest = { version = "0.13.5", default-features = false, features = ["rustls-no-provider", "http2", "stream", "socks", "system-proxy"] }
+rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+sha2 = "0.11.1"
+thiserror = "2.0.21"
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "sync", "time", "net", "io-util", "fs", "signal"] }
+tokio-util = "0.7.20"
+tracing = "0.1.44"
+url = "2.5.8"
+
+[target."cfg(windows)".dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_System_IO", "Win32_System_Ioctl", "Win32_Storage_FileSystem", "Win32_System_SystemInformation"] }
+
+# Local wall-clock time for the queue scheduler.
+[target."cfg(unix)".dependencies]
+libc = "0.2.191"

@@ -1,0 +1,76 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 262" width="1000" height="262" role="img" aria-labelledby="title desc">
+  <title id="title">Spate benchmark results</title>
+  <desc id="desc">Left: an 8 MiB file from a server that limits each connection to 2 MiB/s finishes in 4.00 seconds with 1 connection and 0.52 seconds with 8 connections, 7.7 times faster. Right: a 100 MB file from a high-latency server in Sydney downloads at 12.9 MB/s with curl, 19.1 MB/s with Spate on one connection and 21.8 MB/s with Spate on four connections.</desc>
+  <style>
+    .surface { fill: #fcfcfb; stroke: rgba(11, 11, 11, 0.10); }
+    .grid { stroke: #e1e0d9; stroke-width: 1; }
+    .base { stroke: #c3c2b7; stroke-width: 1; }
+    .spate { fill: #2a78d6; }
+    .other { fill: #898781; }
+    text { font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+    .h { fill: #0b0b0b; font-size: 15px; font-weight: 600; }
+    .sub { fill: #52514e; font-size: 12.5px; }
+    .label { fill: #0b0b0b; font-size: 13px; }
+    .value { fill: #0b0b0b; font-size: 13px; font-weight: 600; font-variant-numeric: tabular-nums; }
+    .tick { fill: #898781; font-size: 12px; font-variant-numeric: tabular-nums; }
+    .note { fill: #898781; font-size: 12px; }
+    @media (prefers-color-scheme: dark) {
+      .surface { fill: #1a1a19; stroke: rgba(255, 255, 255, 0.10); }
+      .grid { stroke: #2c2c2a; }
+      .base { stroke: #383835; }
+      .spate { fill: #3987e5; }
+      .h, .label, .value { fill: #f0efec; }
+      .sub { fill: #c3c2b7; }
+    }
+  </style>
+
+  <rect class="surface" x="0.5" y="0.5" width="999" height="261" rx="12"/>
+
+  <!-- Left panel: time to finish, 0–4 s mapped to x 170–410 (60 px per second) -->
+  <text class="h" x="24" y="34">Server that throttles each connection</text>
+  <text class="sub" x="24" y="54">8 MiB file, 2 MiB/s per connection · seconds to finish, lower is better</text>
+  <line class="grid" x1="230" y1="72" x2="230" y2="178"/>
+  <line class="grid" x1="290" y1="72" x2="290" y2="178"/>
+  <line class="grid" x1="350" y1="72" x2="350" y2="178"/>
+  <line class="grid" x1="410" y1="72" x2="410" y2="178"/>
+  <line class="base" x1="170" y1="72" x2="170" y2="178"/>
+  <text class="label" x="160" y="104" text-anchor="end">1 connection</text>
+  <path class="other" d="M170 89 h236 a4 4 0 0 1 4 4 v14 a4 4 0 0 1 -4 4 h-236 z"/>
+  <text class="value" x="418" y="104">4.00 s</text>
+  <text class="label" x="160" y="150" text-anchor="end">8 connections</text>
+  <path class="spate" d="M170 135 h27.2 a4 4 0 0 1 4 4 v14 a4 4 0 0 1 -4 4 h-27.2 z"/>
+  <text class="value" x="209" y="150">0.52 s · 7.7× faster</text>
+  <text class="tick" x="170" y="196" text-anchor="middle">0</text>
+  <text class="tick" x="230" y="196" text-anchor="middle">1</text>
+  <text class="tick" x="290" y="196" text-anchor="middle">2</text>
+  <text class="tick" x="350" y="196" text-anchor="middle">3</text>
+  <text class="tick" x="410" y="196" text-anchor="middle">4 s</text>
+
+  <!-- Right panel: throughput, 0–25 MB/s mapped to x 690–890 (8 px per MB/s) -->
+  <text class="h" x="524" y="34">High-latency server (Sydney)</text>
+  <text class="sub" x="524" y="54">100 MB file · MB/s, higher is better</text>
+  <line class="grid" x1="730" y1="72" x2="730" y2="178"/>
+  <line class="grid" x1="770" y1="72" x2="770" y2="178"/>
+  <line class="grid" x1="810" y1="72" x2="810" y2="178"/>
+  <line class="grid" x1="850" y1="72" x2="850" y2="178"/>
+  <line class="grid" x1="890" y1="72" x2="890" y2="178"/>
+  <line class="base" x1="690" y1="72" x2="690" y2="178"/>
+  <text class="label" x="680" y="95" text-anchor="end">curl</text>
+  <path class="other" d="M690 80 h99.2 a4 4 0 0 1 4 4 v14 a4 4 0 0 1 -4 4 h-99.2 z"/>
+  <text class="value" x="801" y="95">12.9</text>
+  <text class="label" x="680" y="129" text-anchor="end">Spate, 1 connection</text>
+  <path class="spate" d="M690 114 h148.8 a4 4 0 0 1 4 4 v14 a4 4 0 0 1 -4 4 h-148.8 z"/>
+  <text class="value" x="850.8" y="129">19.1</text>
+  <text class="label" x="680" y="163" text-anchor="end">Spate, 4 connections</text>
+  <path class="spate" d="M690 148 h170.4 a4 4 0 0 1 4 4 v14 a4 4 0 0 1 -4 4 h-170.4 z"/>
+  <text class="value" x="872.4" y="163">21.8</text>
+  <text class="tick" x="690" y="196" text-anchor="middle">0</text>
+  <text class="tick" x="730" y="196" text-anchor="middle">5</text>
+  <text class="tick" x="770" y="196" text-anchor="middle">10</text>
+  <text class="tick" x="810" y="196" text-anchor="middle">15</text>
+  <text class="tick" x="850" y="196" text-anchor="middle">20</text>
+  <text class="tick" x="890" y="196" text-anchor="middle">25 MB/s</text>
+
+  <text class="note" x="24" y="236">Measured October 2026 on one Windows 11 PC with the release build. Results depend on the server and your connection;</text>
+  <text class="note" x="24" y="252">on a link that one connection already fills, more connections cannot add speed.</text>
+</svg>

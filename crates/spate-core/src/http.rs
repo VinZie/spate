@@ -1,0 +1,174 @@
+//! HTTP client construction and response-header helpers.
+
+use std::sync::Once;
+use std::time::Duration;
+
+use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
+use serde::{Deserialize, Serialize};
+
+use crate::error::{Error, Result};
+
+/// Honest by default: bot protection on some CDNs drops TLS connections whose
+/// User-Agent claims to be a browser while the TLS fingerprint is not.
+/// Downloads captured from a browser carry that browser's User-Agent anyway.
+pub const DEFAULT_USER_AGENT: &str = concat!("Spate/", env!("CARGO_PKG_VERSION"));
+
+/// The Chrome-imitating default shipped before 0.1.0; treated as "unset" so
+/// existing settings files pick up the new default.
+pub const LEGACY_USER_AGENT_PREFIX: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0 Safari/537.36 Spate/";
+
+/// `Retry-After` in its delta-seconds form (the HTTP-date form is ignored).
+pub fn retry_after(headers: &HeaderMap) -> Option<Duration> {
+    header_str(headers, reqwest::header::RETRY_AFTER)?.parse::<u64>().ok().map(Duration::from_secs)
+}
+
+/// Network settings shared by every connection of a download.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct NetConfig {
+    pub user_agent: String,
+    /// `http://`, `https://`, `socks5://` or `socks5h://` proxy URL. When
+    /// unset the system proxy configuration is used.
+    pub proxy: Option<String>,
+    pub connect_timeout_secs: u64,
+    /// A connection that delivers no data for this long is restarted.
+    pub read_timeout_secs: u64,
+    pub max_redirects: usize,
+}
+
+impl Default for NetConfig {
+    fn default() -> Self {
+        Self {
+            user_agent: DEFAULT_USER_AGENT.to_string(),
+            proxy: None,
+            connect_timeout_secs: 15,
+            read_timeout_secs: 30,
+            max_redirects: 10,
+        }
+    }
+}
+
+static TLS_INIT: Once = Once::new();
+
+/// Install the process-wide rustls crypto provider (ring).
+pub fn init_tls() {
+    TLS_INIT.call_once(|| {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    });
+}
+
+/// Build a client. Each download connection gets its own client so that every
+/// connection is a separate TCP stream, even against HTTP/2 servers that
+/// would otherwise multiplex them all onto one socket.
+pub fn build_client(cfg: &NetConfig) -> Result<reqwest::Client> {
+    init_tls();
+    let ua = cfg.user_agent.trim();
+    let ua = if ua.is_empty() || ua.starts_with(LEGACY_USER_AGENT_PREFIX) { DEFAULT_USER_AGENT } else { ua };
+    let mut b = reqwest::Client::builder()
+        .user_agent(ua.to_string())
+        .connect_timeout(Duration::from_secs(cfg.connect_timeout_secs.max(1)))
+        .redirect(reqwest::redirect::Policy::limited(cfg.max_redirects))
+        .tcp_nodelay(true)
+        .pool_max_idle_per_host(2)
+        .http2_adaptive_window(true);
+    if let Some(proxy) = cfg.proxy.as_deref().filter(|p| !p.trim().is_empty()) {
+        b = b.proxy(reqwest::Proxy::all(proxy.trim()).map_err(|e| Error::Other(format!("invalid proxy: {e}")))?);
+    }
+    Ok(b.build()?)
+}
+
+/// Turn user/browser supplied headers into a `HeaderMap`, dropping any that
+/// are malformed, hop-by-hop, or managed by the engine. Conditional headers
+/// copied from a browser that has a cached copy would turn the download
+/// into `304 Not Modified` / `412 Precondition Failed`, so they go too.
+pub fn header_map(headers: &[(String, String)]) -> HeaderMap {
+    let mut map = HeaderMap::new();
+    for (k, v) in headers {
+        let lower = k.trim().to_ascii_lowercase();
+        if matches!(
+            lower.as_str(),
+            "range"
+                | "if-range"
+                | "if-none-match"
+                | "if-modified-since"
+                | "if-match"
+                | "if-unmodified-since"
+                | "host"
+                | "content-length"
+                | "transfer-encoding"
+                | "accept-encoding"
+                | "connection"
+                | "keep-alive"
+                | "proxy-connection"
+                | "te"
+                | "upgrade"
+                | "expect"
+        ) {
+            continue;
+        }
+        if let (Ok(name), Ok(value)) = (HeaderName::from_bytes(lower.as_bytes()), HeaderValue::from_str(v.trim())) {
+            map.insert(name, value);
+        }
+    }
+    // Byte ranges must refer to the stored representation.
+    map.insert(reqwest::header::ACCEPT_ENCODING, HeaderValue::from_static("identity"));
+    map
+}
+
+/// Parse `bytes <first>-<last>/<total|*>`.
+pub fn parse_content_range(v: &str) -> Option<(u64, u64, Option<u64>)> {
+    let rest = v.trim().strip_prefix("bytes")?.trim_start();
+    let (range, total) = rest.split_once('/')?;
+    let (first, last) = range.trim().split_once('-')?;
+    let first = first.trim().parse().ok()?;
+    let last = last.trim().parse().ok()?;
+    let total = match total.trim() {
+        "*" => None,
+        t => Some(t.parse().ok()?),
+    };
+    (first <= last).then_some((first, last, total))
+}
+
+pub fn header_str(headers: &HeaderMap, name: impl reqwest::header::AsHeaderName) -> Option<&str> {
+    headers.get(name).and_then(|v| v.to_str().ok()).map(str::trim).filter(|s| !s.is_empty())
+}
+
+/// Whether a failed request is worth retrying.
+pub fn is_retryable_status(code: u16) -> bool {
+    matches!(code, 408 | 425 | 429 | 500 | 502 | 503 | 504) || code >= 520
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn content_range() {
+        assert_eq!(parse_content_range("bytes 0-99/1234"), Some((0, 99, Some(1234))));
+        assert_eq!(parse_content_range("bytes 100-199/*"), Some((100, 199, None)));
+        assert_eq!(parse_content_range("bytes */1234"), None);
+        assert_eq!(parse_content_range("items 0-1/2"), None);
+    }
+
+    #[test]
+    fn engine_headers_are_not_overridable() {
+        let m = header_map(&[("Range".into(), "bytes=5-".into()), ("Cookie".into(), "a=b".into())]);
+        assert!(m.get("range").is_none());
+        assert_eq!(m.get("cookie").unwrap(), "a=b");
+        assert_eq!(m.get("accept-encoding").unwrap(), "identity");
+    }
+
+    #[test]
+    fn browser_cache_validators_are_dropped() {
+        let m = header_map(&[
+            ("If-None-Match".into(), "\"abc\"".into()),
+            ("If-Modified-Since".into(), "Wed, 21 Oct 2026 07:28:00 GMT".into()),
+            ("Connection".into(), "keep-alive".into()),
+            ("Referer".into(), "https://example.com/".into()),
+        ]);
+        assert!(m.get("if-none-match").is_none());
+        assert!(m.get("if-modified-since").is_none());
+        assert!(m.get("connection").is_none());
+        assert_eq!(m.get("referer").unwrap(), "https://example.com/");
+    }
+}

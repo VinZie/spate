@@ -1,0 +1,45 @@
+{
+  "manifest_version": 3,
+  "name": "Spate Browser Integration",
+  "short_name": "Spate",
+  "version": "0.1.0",
+  "description": "Send browser downloads, page links and detected video/audio streams to the Spate download manager.",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAu7iheLskc+cnGY8Dzg6fLq3S58zl9cCx2LbStnUY48ly8zd5uwcb5UgAY9NkYqDwuKBntXutgq9xAmB1taIZ6W5vd62V7SQ/HZW8n6WCjSkgm8Aps9RZj8+4GVRuqXenpSCDYL10UjjBv5okmwvlaVl3c2JOgk05vYE6rkVIjTSzn+E/1gCB2Yj+wKSzb9lnfGXXgjqqYqBjq66/I3f1cCxIt0YiaszguANO+WEtvmoYjvPRT5QF9xUZjcYuE8/Yp7oGOKgRE+frS2rM03QSwfaDr3JHu3QoHGQAYvvo0j0V8aX0bYBwhobPOIEpvozhpGixJT037x69/kp9zb05qQIDAQAB",
+  "minimum_chrome_version": "110",
+  "icons": {
+    "16": "icons/icon-16.png",
+    "32": "icons/icon-32.png",
+    "48": "icons/icon-48.png",
+    "128": "icons/icon-128.png"
+  },
+  "action": {
+    "default_title": "Spate",
+    "default_popup": "src/popup.html",
+    "default_icon": {
+      "16": "icons/icon-16.png",
+      "32": "icons/icon-32.png"
+    }
+  },
+  "options_ui": {
+    "page": "src/options.html",
+    "open_in_tab": true
+  },
+  "background": {
+    "service_worker": "src/background.js",
+    "type": "module"
+  },
+  "permissions": [
+    "downloads",
+    "nativeMessaging",
+    "contextMenus",
+    "cookies",
+    "storage",
+    "webRequest",
+    "webNavigation",
+    "scripting"
+  ],
+  "host_permissions": [
+    "http://*/*",
+    "https://*/*"
+  ]
+}

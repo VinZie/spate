@@ -1,0 +1,46 @@
+name: Bug report
+description: Something doesn't work as expected
+labels: [bug]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened?
+      description: What you did, what you expected and what happened instead.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Add https://...
+        2. ...
+  - type: input
+    id: version
+    attributes:
+      label: Spate version
+      placeholder: "0.1.0 (Help → About, or spate-cli --version)"
+    validations:
+      required: true
+  - type: input
+    id: windows
+    attributes:
+      label: Windows version
+      placeholder: Windows 11 24H2
+  - type: dropdown
+    id: part
+    attributes:
+      label: Which part?
+      options:
+        - Desktop app
+        - spate-cli
+        - Browser extension (Chrome / Edge / Brave)
+        - Browser extension (Firefox)
+        - Download engine (any front end)
+  - type: textarea
+    id: logs
+    attributes:
+      label: Output or logs
+      description: For a failing download, `spate-cli info <url>` output helps. Remove anything private, such as cookies or tokens.
+      render: text

@@ -1,0 +1,13 @@
+{
+  "name": "spate-extension",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Spate browser integration (Chromium MV3 and Firefox). No runtime dependencies.",
+  "type": "module",
+  "scripts": {
+    "icons": "node scripts/make-icons.mjs",
+    "build": "node build.mjs",
+    "test": "node --test test/*.test.mjs",
+    "check": "node scripts/check.mjs"
+  }
+}

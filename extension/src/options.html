@@ -1,0 +1,88 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Spate options</title>
+  <link rel="stylesheet" href="ui.css">
+  <link rel="stylesheet" href="options.css">
+</head>
+<body>
+  <main>
+    <header>
+      <img src="../icons/icon-48.png" width="36" height="36" alt="">
+      <div>
+        <h1>Spate browser integration</h1>
+        <p class="muted">Send downloads, links and detected streams to the Spate download manager.</p>
+      </div>
+    </header>
+
+    <form id="form" novalidate>
+      <section>
+        <h2>Download capture</h2>
+        <label class="switch row">
+          <input type="checkbox" name="enabled">
+          <span>Capture browser downloads and send them to Spate</span>
+        </label>
+        <label class="switch row">
+          <input type="checkbox" name="interactive">
+          <span>Show the Spate confirmation dialog (file name, folder, start now or later)</span>
+        </label>
+        <label class="switch row">
+          <input type="checkbox" name="captureAll">
+          <span>Capture all downloads, whatever their file type</span>
+        </label>
+
+        <div class="field" id="extensions-field">
+          <label for="extensions">File types to capture</label>
+          <textarea id="extensions" name="extensions" rows="4" spellcheck="false"></textarea>
+          <p class="hint muted">Separate with spaces or commas. Wildcards work: <code>r??</code> matches r00, r01…; <code>part*</code> matches part1, part2…</p>
+        </div>
+
+        <div class="field">
+          <label for="minSizeKB">Minimum file size</label>
+          <div class="inline">
+            <input type="number" id="minSizeKB" name="minSizeKB" min="0" step="1" inputmode="numeric">
+            <span class="muted">KB (0 = no minimum; only applied when the browser knows the size)</span>
+          </div>
+        </div>
+      </section>
+
+      <section>
+        <h2>Excluded sites</h2>
+        <div class="field">
+          <label for="excludedSites">Never capture downloads from or linked by these sites</label>
+          <textarea id="excludedSites" name="excludedSites" rows="5" spellcheck="false" placeholder="example.com&#10;*.cdn.example.org&#10;files.example.net/public/"></textarea>
+          <p class="hint muted">One pattern per line. <code>example.com</code> also covers its subdomains, <code>*</code> and <code>?</code> are wildcards, and a pattern with a path (<code>example.com/downloads/</code>) matches addresses starting with it.</p>
+        </div>
+      </section>
+
+      <section>
+        <h2>Media detection</h2>
+        <label class="switch row">
+          <input type="checkbox" name="detectMedia">
+          <span>Detect video and audio files and HLS streams that pages load</span>
+        </label>
+        <p class="hint muted">Detected media appear in the toolbar popup and in the page's context menu. DASH (.mpd) streams are listed but cannot be downloaded yet.</p>
+      </section>
+
+      <div class="actions">
+        <button type="submit" class="primary" id="save">Save</button>
+        <button type="button" id="reset">Restore defaults</button>
+        <span id="saved" class="muted" aria-live="polite"></span>
+      </div>
+    </form>
+
+    <section>
+      <h2>Connection</h2>
+      <div id="status" class="status">
+        <span class="dot"></span>
+        <div id="status-text">Not tested yet.</div>
+      </div>
+      <p><button type="button" id="test">Test connection</button></p>
+      <p class="muted">The extension talks to the native messaging host <code id="host-name">com.spate.host</code>, which is installed by running <code>spate-cli install-host</code>. It registers this extension (ID <code id="extension-id"></code>) as allowed to use it.</p>
+    </section>
+  </main>
+  <script type="module" src="options.js"></script>
+</body>
+</html>

@@ -1,0 +1,88 @@
+body {
+  background: var(--surface);
+  font-size: 14px;
+}
+
+main {
+  max-width: 720px;
+  margin: 0 auto;
+  padding: 24px 16px 48px;
+}
+
+header {
+  display: flex;
+  gap: 14px;
+  align-items: center;
+  margin-bottom: 18px;
+}
+header h1 {
+  font-size: 20px;
+  margin: 0;
+}
+header p { margin: 2px 0 0; }
+
+section {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 16px 18px;
+  margin-bottom: 14px;
+}
+section h2 {
+  font-size: 15px;
+  margin: 0 0 12px;
+}
+
+.row {
+  display: flex;
+  margin: 8px 0;
+}
+
+.field { margin-top: 14px; }
+.field > label {
+  display: block;
+  font-weight: 600;
+  margin-bottom: 6px;
+}
+.field .inline {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+textarea,
+input[type="number"] {
+  font: 13px/1.4 ui-monospace, "Cascadia Mono", Consolas, monospace;
+  color: var(--text);
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 6px 8px;
+}
+textarea {
+  width: 100%;
+  resize: vertical;
+}
+input[type="number"] { width: 120px; }
+textarea:focus,
+input[type="number"]:focus {
+  outline: 2px solid var(--accent);
+  outline-offset: -1px;
+  border-color: transparent;
+}
+textarea:disabled { opacity: 0.55; }
+
+.hint {
+  font-size: 12.5px;
+  margin: 6px 0 0;
+}
+
+.actions {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  margin: 4px 0 18px;
+}
+
+#status { margin-bottom: 6px; }

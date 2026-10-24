@@ -1,0 +1,22 @@
+[package]
+name = "spate"
+version = "0.1.0"
+edition = "2024"
+description = "Spate desktop download manager"
+license = "MIT"
+
+[dependencies]
+arboard = { version = "3.7.0", default-features = false }
+chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"] }
+eframe = { version = "0.37.0", default-features = false, features = ["default_fonts", "glow", "persistence", "accesskit", "clipboard", "links", "wayland", "x11"] }
+egui_extras = { version = "0.37.0", default-features = false }
+spate-core = { version = "0.1.0", path = "../spate-core" }
+rfd = "0.17.2"
+serde = { version = "1.0.229", features = ["derive"] }
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "sync", "time", "macros"] }
+
+[target."cfg(windows)".dependencies]
+tray-icon = { version = "0.26.1", default-features = false }
+
+[build-dependencies]
+embed-resource = "3.0.12"

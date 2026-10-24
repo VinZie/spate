@@ -1,0 +1,52 @@
+Spate for Windows (64-bit)
+==========================
+
+Spate is a free, open-source download manager (MIT licence). This folder is
+portable: nothing is installed or registered until you ask for it.
+
+What's here
+  spate.exe                  The desktop app. Double-click to start.
+  spate-cli.exe              Terminal downloads and the browser helper.
+                             Keep it in the same folder as spate.exe.
+  extension\chromium\        Browser extension for Chrome, Edge, Brave.
+  extension\firefox\         Browser extension for Firefox.
+  THIRD-PARTY-LICENSES.txt   Licences of the open-source libraries built in.
+
+Getting started
+  1. Put this folder where it will stay, for example
+     %LOCALAPPDATA%\Programs\Spate. The browser helper is registered by
+     path, so if you move the folder later, register it again (step 1 below).
+  2. Run spate.exe and click "Add URL" (Ctrl+N). Turn on Options -> "Watch
+     clipboard for links" if you want Spate to offer every link you copy.
+
+   The executables are not code-signed. If Windows SmartScreen says
+   "Windows protected your PC", choose "More info" -> "Run anyway".
+
+Catching downloads from the browser (optional)
+  1. In Spate open Options -> Browser integration... and click
+     "Register helper". This writes per-user registry entries only; no
+     administrator rights are needed. Undo it any time with:
+         spate-cli.exe uninstall-host
+  2. Chrome / Edge / Brave: open chrome://extensions (edge://extensions in
+     Edge), switch on Developer mode, click "Load unpacked" and pick the
+     extension\chromium folder.
+     Firefox: open about:debugging#/runtime/this-firefox, choose "Load
+     Temporary Add-on..." and pick extension\firefox\manifest.json. (Firefox
+     removes temporary add-ons when it restarts.)
+
+Terminal use
+  spate-cli.exe get https://example.com/big.iso -c 16       download here
+  spate-cli.exe info https://example.com/big.iso            size, resume support
+  spate-cli.exe add https://example.com/file.zip            hand to the app
+  spate-cli.exe --help                                      everything else
+
+  Ctrl+C pauses a "get"; run the same command again to resume.
+
+Where Spate keeps its data
+  %LOCALAPPDATA%\Spate (download list, settings). Set the SPATE_DATA_DIR
+  environment variable to use another folder.
+
+Uninstall
+  Run "spate-cli.exe uninstall-host" if you registered the browser helper,
+  untick "Start Spate in the background when I sign in" in Options if you
+  ticked it, then delete this folder and %LOCALAPPDATA%\Spate.

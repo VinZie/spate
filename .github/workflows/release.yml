@@ -1,0 +1,40 @@
+name: Release
+
+# Push a tag such as v0.2.0 to build the Windows package and publish a release
+# with the zip and its SHA-256 checksum attached.
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  package:
+    name: Build and publish
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: Swatinem/rust-cache@v2
+      - name: Test
+        run: cargo test --workspace --locked
+      - name: Package
+        shell: pwsh
+        run: ./packaging/package-windows.ps1
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.zip
+            dist/*.zip.sha256
+          generate_release_notes: true
+          body: |
+            **Download:** the `windows-x64.zip` below (Windows 10 and 11, 64-bit). Unzip it and run `spate.exe`; the included `README.txt` covers browser integration.
+
+            The executables are not code-signed yet, so SmartScreen may warn on first run (More info → Run anyway). This zip was built by GitHub Actions from the tagged source; compare it with the `.sha256` file.
+
+            See [CHANGELOG.md](https://github.com/${{ github.repository }}/blob/${{ github.ref_name }}/CHANGELOG.md) for what changed.

@@ -1,0 +1,23 @@
+[package]
+name = "spate-cli"
+version = "0.1.0"
+edition = "2024"
+description = "Spate command line: downloads, app control and browser native-messaging host"
+license = "MIT"
+
+[dependencies]
+clap = { version = "4.6.7", features = ["derive"] }
+spate-core = { version = "0.1.0", path = "../spate-core" }
+reqwest = { version = "0.13.5", default-features = false }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "signal", "time", "sync"] }
+tokio-util = "0.7.20"
+url = "2.5.8"
+
+[target."cfg(windows)".dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_System_Console"] }
+winreg = "0.56.0"
+
+[build-dependencies]
+embed-resource = "3.0.12"
