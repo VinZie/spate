@@ -6,7 +6,9 @@
 //! bodies without `Content-Length`, per-connection throttling, a cap on
 //! concurrently served requests (extra requests get `503`), connection drops
 //! and stalls injected into the first N body responses, runtime content/ETag
-//! changes, `Content-Disposition`, a redirect path and keep-alive.
+//! changes, rejecting every request from some point on, `Content-Disposition`,
+//! a redirect path (also to another server) and keep-alive. The request log
+//! keeps each request's headers.
 
 #![allow(dead_code)]
 
@@ -63,7 +65,8 @@ pub struct ServerConfig {
     pub last_modified: Option<String>,
     pub content_disposition: Option<String>,
     pub content_type: Option<String>,
-    /// Requests for this path get `302 Found` pointing at `redirect_to`.
+    /// Requests for this path get `302 Found` pointing at `redirect_to` (a
+    /// path, or a URL on another server).
     pub redirect_from: Option<String>,
     pub redirect_to: String,
     pub keep_alive: bool,
@@ -115,6 +118,14 @@ pub struct RequestLog {
     pub if_range: Option<String>,
     /// Content version that served the request.
     pub version: u64,
+    /// Request headers, names in lower case.
+    pub headers: Vec<(String, String)>,
+}
+
+impl RequestLog {
+    pub fn header(&self, name: &str) -> Option<&str> {
+        self.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case(name)).map(|(_, v)| v.as_str())
+    }
 }
 
 #[derive(Default)]
@@ -184,6 +195,9 @@ struct State {
     content: RwLock<Content>,
     throttle: AtomicU64,
     max_concurrent: AtomicUsize,
+    /// `(n, status)`: request number `n` (counting from 0) and all later
+    /// ones are answered with `status`.
+    reject_from: Mutex<Option<(usize, u16)>>,
     stats: Stats,
     cancel: CancellationToken,
 }
@@ -209,6 +223,7 @@ impl TestServer {
             }),
             throttle: AtomicU64::new(cfg.throttle.unwrap_or(0)),
             max_concurrent: AtomicUsize::new(cfg.max_concurrent.unwrap_or(0)),
+            reject_from: Mutex::new(None),
             cfg,
             stats: Stats::default(),
             cancel: CancellationToken::new(),
@@ -285,6 +300,12 @@ impl TestServer {
 
     pub fn set_max_concurrent(&self, max: Option<usize>) {
         self.state.max_concurrent.store(max.unwrap_or(0), Ordering::SeqCst);
+    }
+
+    /// Answer request number `n` (counting every request from 0, see
+    /// [`Stats::requests`]) and all later ones with `status`.
+    pub fn reject_from(&self, n: usize, status: u16) {
+        *self.state.reject_from.lock() = Some((n, status));
     }
 }
 
@@ -474,7 +495,7 @@ fn parse_range(v: &str, size: u64) -> Option<Result<(u64, u64), ()>> {
 /// Serve one request. Returns whether the connection may be reused.
 async fn serve(st: &State, io: &mut BufReader<TcpStream>, req: &Request) -> std::io::Result<bool> {
     let stats = &st.stats;
-    stats.requests.fetch_add(1, Ordering::SeqCst);
+    let nth = stats.requests.fetch_add(1, Ordering::SeqCst);
     let cfg = &st.cfg;
     let (body, etag, last_modified, version) = {
         let c = st.content.read();
@@ -491,8 +512,19 @@ async fn serve(st: &State, io: &mut BufReader<TcpStream>, req: &Request) -> std:
             range,
             if_range: if_range.clone(),
             version,
+            headers: req.headers.clone(),
         });
     };
+
+    let reject = *st.reject_from.lock();
+    if let Some((from, code)) = reject
+        && nth >= from
+    {
+        log(code, None);
+        let head = format!("HTTP/1.1 {code} Rejected\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+        io.get_mut().write_all(head.as_bytes()).await?;
+        return Ok(false);
+    }
 
     if cfg.redirect_from.as_deref() == Some(req.path.as_str()) {
         log(302, None);

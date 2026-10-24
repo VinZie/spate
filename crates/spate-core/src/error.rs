@@ -21,8 +21,29 @@ pub enum Error {
     InvalidUrl(String),
     #[error("checksum mismatch: expected {expected}, got {actual}")]
     Checksum { expected: String, actual: String },
+    /// The size the server declared doesn't fit on the target volume.
+    #[error("not enough disk space: the file needs {} but only {} are free", size(.needed), size(.available))]
+    DiskFull { needed: u64, available: u64 },
     #[error("{0}")]
     Other(String),
+}
+
+/// `1.5 GiB`-style size for messages.
+fn size(bytes: &u64) -> String {
+    const UNITS: [&str; 4] = ["KiB", "MiB", "GiB", "TiB"];
+    let mut value = *bytes as f64;
+    let mut unit = None;
+    for u in UNITS {
+        if value < 1024.0 {
+            break;
+        }
+        value /= 1024.0;
+        unit = Some(u);
+    }
+    match unit {
+        Some(u) => format!("{value:.1} {u}"),
+        None => format!("{bytes} bytes"),
+    }
 }
 
 impl Error {
