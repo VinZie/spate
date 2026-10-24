@@ -455,13 +455,18 @@ async fn sha256_verification() {
     let mut o = opts(4);
     o.expected_sha256 = Some("00".repeat(32));
     let run = run_download(request(server.url("/files/bad.bin"), dir.path()), o, None).await;
-    match run.result {
+    match &run.result {
         Err(Error::Checksum { expected, actual }) => {
-            assert_eq!(expected, "00".repeat(32));
-            assert_eq!(actual, server.sha256());
+            assert_eq!(*expected, "00".repeat(32));
+            assert_eq!(*actual, server.sha256());
         }
         other => panic!("expected a checksum error, got {other:?}"),
     }
+    // A file that fails never appears under its final name, where it would
+    // look finished, and no resume point claims the deleted partial file.
+    assert_eq!(dir.files(), vec!["good.bin".to_string()]);
+    let cp = run.progress.checkpoint().expect("a resume point that starts over");
+    assert_eq!((cp.written(), cp.part_token), (0, None));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -730,4 +735,169 @@ async fn transient_probe_failure_is_retried() {
     assert!(matches!(run.result, Err(Error::Status(404))), "got {:?}", run.result);
     assert_eq!(server.stats().requests(), 1);
     assert!(dir.files().is_empty(), "nothing may be created for a failed probe: {:?}", dir.files());
+}
+
+fn with_credentials(mut req: DownloadRequest) -> DownloadRequest {
+    req.headers = vec![
+        ("Cookie".into(), "session=SECRET-FOR-SITE".into()),
+        ("Authorization".into(), "Bearer SECRET-FOR-SITE".into()),
+    ];
+    req
+}
+
+/// Login cookies and `Authorization` belong to the site the download was
+/// started from. When it redirects to another host they must stay behind:
+/// on the first request, on the other connections (which go to the redirect
+/// target directly), on a further redirect there, and after a resume.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn credentials_never_follow_a_redirect_to_another_host() {
+    let size = 4 * MIB;
+    // The file host is reached as "localhost", not 127.0.0.1 like the site,
+    // and redirects once more within itself.
+    let cdn = TestServer::start(ServerConfig {
+        throttle: Some(MIB),
+        redirect_from: Some("/signed".into()),
+        redirect_to: "/files/report.bin".into(),
+        ..ServerConfig::sized(size)
+    });
+    let site = TestServer::start(ServerConfig {
+        redirect_from: Some("/download".into()),
+        redirect_to: format!("http://localhost:{}/signed", cdn.addr.port()),
+        ..ServerConfig::sized(0)
+    });
+    let dir = TempDir::new("cred-redirect");
+    let req = with_credentials(request(site.url("/download"), dir.path()));
+    let o = opts(4);
+    let cp = start_and_pause(&cdn, &req, &o, MIB).await;
+    cdn.set_throttle(None);
+    let run = run_download(req, o, Some(cp)).await;
+    let (path, _) = completed(&run);
+    assert_file_eq(&path, &cdn.body());
+
+    let site_log = site.stats().log();
+    assert!(site_log.len() >= 2, "resumed connections start at the site again: {site_log:?}");
+    for e in &site_log {
+        assert_eq!(e.header("cookie"), Some("session=SECRET-FOR-SITE"), "{e:?}");
+        assert_eq!(e.header("authorization"), Some("Bearer SECRET-FOR-SITE"), "{e:?}");
+    }
+    let cdn_log = cdn.stats().log();
+    assert!(cdn.stats().body_requests() >= 4, "several connections: {cdn_log:?}");
+    assert!(cdn_log.iter().any(|e| e.path == "/signed"));
+    for e in &cdn_log {
+        assert!(e.header("cookie").is_none() && e.header("authorization").is_none(), "credentials sent to the other host: {e:?}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn credentials_reach_every_connection_to_their_own_site() {
+    let size = 4 * MIB;
+    let server = TestServer::start(ServerConfig {
+        throttle: Some(MIB),
+        redirect_from: Some("/download".into()),
+        redirect_to: "/files/members.bin".into(),
+        ..ServerConfig::sized(size)
+    });
+    let dir = TempDir::new("cred-same");
+    let run = run_download(with_credentials(request(server.url("/download"), dir.path())), opts(4), None).await;
+    let (path, _) = completed(&run);
+    assert_file_eq(&path, &server.body());
+    let log = server.stats().log();
+    assert!(server.stats().body_requests() >= 4, "several connections: {log:?}");
+    for e in &log {
+        assert_eq!(e.header("cookie"), Some("session=SECRET-FOR-SITE"), "{e:?}");
+        assert_eq!(e.header("authorization"), Some("Bearer SECRET-FOR-SITE"), "{e:?}");
+    }
+}
+
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn completed_download_carries_the_mark_of_the_web() {
+    let server = TestServer::start(ServerConfig { redirect_from: Some("/go".into()), ..ServerConfig::sized(256 * KIB) });
+    let dir = TempDir::new("motw");
+    let mut req = request(server.url("/go"), dir.path());
+    req.headers = vec![("Referer".into(), "https://example.com/downloads".into())];
+    let run = run_download(req, opts(2), None).await;
+    let (path, _) = completed(&run);
+    assert_file_eq(&path, &server.body());
+    let zone = std::fs::read_to_string(format!("{}:Zone.Identifier", path.display())).expect("a Zone.Identifier stream");
+    assert!(zone.contains("ZoneId=3\r\n"), "{zone}");
+    // The host the bytes came from, i.e. after the redirect.
+    assert!(zone.contains(&format!("HostUrl={}\r\n", server.url("/dl/actual.bin"))), "{zone}");
+    assert!(zone.contains("ReferrerUrl=https://example.com/downloads\r\n"), "{zone}");
+}
+
+/// A resume point can outlive its partial file (the engine used to delete it
+/// on a restart and leave the resume point naming it). If another download
+/// has since created a file of that name, resuming must neither take over
+/// that file nor delete it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stale_resume_data_never_takes_over_another_downloads_file() {
+    let size = 2 * MIB;
+    let first = TestServer::start(ServerConfig { throttle: Some(MIB), ..ServerConfig::sized(size) });
+    let other = TestServer::start(ServerConfig { throttle: Some(MIB), seed: 666, ..ServerConfig::sized(size) });
+    let dir = TempDir::new("stale-part");
+    let o = opts(2);
+    let first_req = request(first.url("/files/same.bin"), dir.path());
+    let stale = start_and_pause(&first, &first_req, &o, MIB / 2).await;
+    std::fs::remove_file(stale.part_path()).unwrap();
+
+    let other_req = request(other.url("/files/same.bin"), dir.path());
+    let other_cp = start_and_pause(&other, &other_req, &o, MIB / 2).await;
+    assert_eq!(other_cp.part_path(), stale.part_path(), "both downloads want the same file");
+    let other_part = std::fs::read(other_cp.part_path()).unwrap();
+
+    first.set_throttle(None);
+    let run = run_download(first_req, o.clone(), Some(stale.clone())).await;
+    let (path, _) = completed(&run);
+    assert_file_eq(&path, &first.body());
+    assert_ne!(path, stale.file_path, "the name belongs to the other download now");
+    assert_eq!(std::fs::read(other_cp.part_path()).unwrap(), other_part, "the other download's file was touched");
+
+    other.set_throttle(None);
+    let mark = other.stats().log_len();
+    let run = run_download(other_req, o, Some(other_cp.clone())).await;
+    let (path, _) = completed(&run);
+    assert_eq!(path, other_cp.file_path);
+    assert_file_eq(&path, &other.body());
+    let resumed = &other.stats().log()[mark..];
+    assert!(resumed.iter().all(|e| e.range != Some((0, size))), "it started over instead of resuming: {resumed:?}");
+    no_part_files(&dir);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn failed_restart_leaves_no_resume_point_naming_the_deleted_file() {
+    let size = 2 * MIB;
+    let server = TestServer::start(ServerConfig { throttle: Some(MIB), ..ServerConfig::sized(size) });
+    let dir = TempDir::new("restart-fails");
+    let req = request(server.url("/files/r.bin"), dir.path());
+    let cp = start_and_pause(&server, &req, &opts(2), MIB / 2).await;
+    // The file changes on the server, so the resumed (single) connection
+    // finds the download must start over; that new start then fails.
+    server.change_content(size, 9, Some("\"v2\""), None);
+    server.reject_from(server.stats().requests() + 1, 404);
+    let run = run_download(req, opts(1), Some(cp.clone())).await;
+    assert!(matches!(run.result, Err(Error::Status(404))), "got {:?}", run.result);
+    assert!(!cp.part_path().exists());
+    let latest = run.progress.checkpoint().expect("a resume point that starts over");
+    assert_eq!(latest.file_path, cp.file_path, "the next attempt keeps the name");
+    assert_eq!((latest.written(), latest.part_token), (0, None));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn simultaneous_downloads_of_one_name_get_separate_files() {
+    // Both servers hold their answer, so both downloads pick a name at about
+    // the same moment.
+    let delay = Some((Duration::from_millis(300), 1));
+    let a = TestServer::start(ServerConfig { head_delay: delay, ..ServerConfig::sized(MIB) });
+    let b = TestServer::start(ServerConfig { head_delay: delay, seed: 7, ..ServerConfig::sized(MIB) });
+    let dir = TempDir::new("same-moment");
+    let (ra, rb) = tokio::join!(
+        run_download(request(a.url("/files/same.bin"), dir.path()), opts(2), None),
+        run_download(request(b.url("/files/same.bin"), dir.path()), opts(2), None),
+    );
+    let ((pa, _), (pb, _)) = (completed(&ra), completed(&rb));
+    assert_ne!(pa, pb);
+    assert_file_eq(&pa, &a.body());
+    assert_file_eq(&pb, &b.body());
+    no_part_files(&dir);
 }

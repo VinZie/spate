@@ -21,9 +21,17 @@
 //! connection received for the same offsets; a mismatch (or a changed
 //! validator) restarts the download from scratch, with a single connection
 //! if the data itself disagreed.
+//!
+//! Safety: redirects are followed here rather than by reqwest, and every hop
+//! gets the headers scoped to it, so cookies and `Authorization` only ever
+//! reach the origin they were collected for. A partial file ends with a
+//! random token that the resume data records; a file without it belongs to
+//! someone else and is never resumed into or deleted. Completed files are
+//! verified before they get their final name, and carry the Mark of the Web.
 
 use std::collections::VecDeque;
-use std::fs::File;
+use std::fs::{File, OpenOptions};
+use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
@@ -66,6 +74,8 @@ const MAX_RESTARTS: u32 = 2;
 /// Spacing of attempts to replace retired connections (doubles on failure).
 const REINFORCE_MIN: Duration = Duration::from_secs(2);
 const REINFORCE_MAX: Duration = Duration::from_secs(60);
+/// Length of the random token that marks a partial file as one download's.
+const TOKEN_LEN: usize = 16;
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct DownloadRequest {
@@ -116,6 +126,10 @@ pub struct ResumeData {
     pub etag: Option<String>,
     pub last_modified: Option<String>,
     pub segments: Vec<Segment>,
+    /// Hex of the random token at the end of the partial file. Resume data
+    /// without one (or whose file doesn't end with it) claims no file.
+    #[serde(default)]
+    pub part_token: Option<String>,
 }
 
 impl ResumeData {
@@ -126,6 +140,44 @@ impl ResumeData {
     pub fn written(&self) -> u64 {
         self.segments.iter().map(|s| s.done).sum()
     }
+
+    fn token(&self) -> Option<[u8; TOKEN_LEN]> {
+        hex::decode(self.part_token.as_deref()?).ok()?.try_into().ok()
+    }
+
+    /// The same download with nothing written and no file claimed: the next
+    /// run starts over under the same name.
+    fn start_over(&self) -> Self {
+        Self { segments: Vec::new(), part_token: None, ..self.clone() }
+    }
+}
+
+/// Delete the partial file of `resume`, but only if it is still the one that
+/// download wrote: another download may have created a file of the same name
+/// since. Returns whether a file was deleted.
+pub fn discard_part(resume: &ResumeData) -> bool {
+    let path = resume.part_path();
+    let ours = resume.token().is_some_and(|t| File::open(&path).is_ok_and(|f| has_token(&f, &t)));
+    ours && std::fs::remove_file(&path).is_ok()
+}
+
+fn new_token() -> Result<[u8; TOKEN_LEN]> {
+    let mut token = [0u8; TOKEN_LEN];
+    getrandom::fill(&mut token).map_err(|e| Error::Other(format!("no random numbers: {e}")))?;
+    Ok(token)
+}
+
+/// Whether `file` ends with `token`.
+fn has_token(file: &File, token: &[u8; TOKEN_LEN]) -> bool {
+    let Ok(len) = file.metadata().map(|m| m.len()) else { return false };
+    let mut tail = [0u8; TOKEN_LEN];
+    len >= TOKEN_LEN as u64 && fileio::read_exact_at(file, &mut tail, len - TOKEN_LEN as u64).is_ok() && tail == *token
+}
+
+/// Cut `file` to `at` bytes and append `token`.
+fn write_token(file: &File, at: u64, token: &[u8; TOKEN_LEN]) -> io::Result<()> {
+    file.set_len(at)?;
+    fileio::write_all_at(file, token, at)
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -241,8 +293,11 @@ pub async fn run(
                 restarts += 1;
                 let checkpoint = progress.checkpoint.lock().take();
                 if let Some(cp) = checkpoint {
-                    let _ = std::fs::remove_file(cp.part_path());
+                    discard_part(&cp);
                     keep_name(&mut req, &cp.file_path);
+                    // Should the fresh attempt fail before it has a file of
+                    // its own, no resume point may still name the old one.
+                    *progress.checkpoint.lock() = Some(cp.start_over());
                 }
                 if corrupted.load(Ordering::Relaxed) || restarts > 1 {
                     opts.connections = 1;
@@ -283,6 +338,70 @@ fn head_timeout(net: &NetConfig) -> Duration {
     Duration::from_secs(net.read_timeout_secs.max(1))
 }
 
+/// A client for one connection: the settings of [`http::build_client`]
+/// (keep the two in step), except that redirects are left to [`fetch`].
+fn build_client(net: &NetConfig) -> Result<reqwest::Client> {
+    http::init_tls();
+    let ua = net.user_agent.trim();
+    let ua = if ua.is_empty() || ua.starts_with(http::LEGACY_USER_AGENT_PREFIX) { http::DEFAULT_USER_AGENT } else { ua };
+    let mut b = reqwest::Client::builder()
+        .user_agent(ua.to_string())
+        .connect_timeout(Duration::from_secs(net.connect_timeout_secs.max(1)))
+        .redirect(reqwest::redirect::Policy::none())
+        .tcp_nodelay(true)
+        .pool_max_idle_per_host(2)
+        .http2_adaptive_window(true);
+    if let Some(proxy) = net.proxy.as_deref().filter(|p| !p.trim().is_empty()) {
+        b = b.proxy(reqwest::Proxy::all(proxy.trim()).map_err(|e| Error::Other(format!("invalid proxy: {e}")))?);
+    }
+    Ok(b.build()?)
+}
+
+/// GET `url` with `headers` (collected for `origin`) plus `extra`, following
+/// redirects. Each hop is sent the headers scoped to it, so cookies and
+/// `Authorization` reach `origin` only: not another host, not a later hop
+/// there, not plain http after https. (reqwest's own redirect handling
+/// restores the first request's headers on every hop and compares only with
+/// the previous one, so A -> B -> B/x would hand A's cookie to B.)
+async fn fetch(
+    client: &reqwest::Client,
+    url: &Url,
+    origin: &Url,
+    headers: &HeaderMap,
+    extra: HeaderMap,
+    max_redirects: usize,
+) -> Result<reqwest::Response> {
+    let mut url = url.clone();
+    let mut hops = 0;
+    loop {
+        let mut h = http::scoped_headers(headers, origin, &url);
+        for (name, value) in &extra {
+            h.insert(name, value.clone());
+        }
+        let resp = client.get(url.clone()).headers(h).send().await?;
+        let redirect = matches!(
+            resp.status(),
+            StatusCode::MOVED_PERMANENTLY
+                | StatusCode::FOUND
+                | StatusCode::SEE_OTHER
+                | StatusCode::TEMPORARY_REDIRECT
+                | StatusCode::PERMANENT_REDIRECT
+        );
+        let Some(location) = header_str(resp.headers(), header::LOCATION).filter(|_| redirect) else {
+            return Ok(resp);
+        };
+        let next = url.join(location).map_err(|e| Error::InvalidUrl(format!("bad redirect target: {e}")))?;
+        if !matches!(next.scheme(), "http" | "https") {
+            return Err(Error::InvalidUrl(format!("redirect to unsupported scheme `{}`", next.scheme())));
+        }
+        hops += 1;
+        if hops > max_redirects {
+            return Err(Error::Other("too many redirects".into()));
+        }
+        url = next;
+    }
+}
+
 async fn run_once(
     req: &DownloadRequest,
     opts: &EngineOptions,
@@ -296,16 +415,22 @@ async fn run_once(
     if !matches!(url.scheme(), "http" | "https") {
         return Err(Error::InvalidUrl(format!("unsupported scheme `{}`", url.scheme())));
     }
+    // Cookies and `Authorization` were collected for this URL, also when
+    // resuming or restarting.
+    let origin = url.clone();
     let headers = http::header_map(&req.headers);
-    let first_client = http::build_client(&opts.net)?;
+    let first_client = build_client(&opts.net)?;
 
     let mut fresh = None;
     let resumed = match resume.map(|r| Setup::resumed(url.clone(), r, opts)) {
         Some(Ok(setup)) => Some(setup),
         Some(Err(stale)) => {
-            // The partial data cannot be trusted (or used): start over.
+            // The partial data cannot be trusted (or used): start over. Its
+            // file goes only if it is still ours; if another download has
+            // taken the name since, the fresh attempt gets another one.
             tracing::info!(path = %stale.part_path().display(), "resume data unusable, restarting");
-            let _ = std::fs::remove_file(stale.part_path());
+            discard_part(&stale);
+            *progress.checkpoint.lock() = Some(stale.start_over());
             let mut r = req.clone();
             keep_name(&mut r, &stale.file_path);
             fresh = Some(r);
@@ -329,7 +454,9 @@ async fn run_once(
     let file = Arc::new(setup.file);
     let ctx = Arc::new(Ctx {
         url: setup.request_url,
+        origin,
         headers,
+        token: setup.token,
         writer: Writer {
             file: file.clone(),
             budget: Arc::new(Semaphore::new(WRITE_BUDGET_KIB as usize)),
@@ -374,7 +501,7 @@ async fn run_once(
         let initial = first_response.and_then(|r| ctx.progress.table.lock().claim(0).map(|slot| (slot, r)));
         set.spawn(worker(ctx.clone(), 0, first_client, initial, None));
         for id in 1..start_with {
-            set.spawn(worker(ctx.clone(), id, http::build_client(&opts.net)?, None, None));
+            set.spawn(worker(ctx.clone(), id, build_client(&opts.net)?, None, None));
         }
         let mut next_id = start_with;
         let mut probe_up_after = PROBE_UP_AFTER;
@@ -426,7 +553,7 @@ async fn run_once(
                         && !ctx.stop.is_cancelled()
                         && set.len() < ctx.limit.load(Ordering::SeqCst).min(target)
                         && ctx.progress.table.lock().can_claim();
-                    if wanted && let Ok(client) = http::build_client(&opts.net) {
+                    if wanted && let Ok(client) = build_client(&opts.net) {
                         let flag = Arc::new(AtomicBool::new(false));
                         set.spawn(worker(ctx.clone(), next_id, client, None, Some(flag.clone())));
                         next_id += 1;
@@ -471,6 +598,7 @@ struct Setup {
     request_url: Url,
     file: File,
     part_path: PathBuf,
+    token: [u8; TOKEN_LEN],
     table: SegmentTable,
     info: FileInfo,
     etag: Option<String>,
@@ -493,14 +621,18 @@ fn segments_tile(segments: &[Segment], total: u64) -> bool {
 
 impl Setup {
     /// Reopen a partial download, or hand the resume data back if it cannot
-    /// be used (no range support, missing or resized part file, bad map).
+    /// be used (no range support, missing, resized or foreign part file, bad
+    /// map).
     fn resumed(url: Url, r: ResumeData, opts: &EngineOptions) -> std::result::Result<Self, ResumeData> {
         let Some(total) = r.total.filter(|_| r.resumable) else { return Err(r) };
         if !segments_tile(&r.segments, total) {
             return Err(r);
         }
+        let Some(token) = r.token() else { return Err(r) };
         let Ok(file) = fileio::open_partial(&r.part_path()) else { return Err(r) };
-        if !file.metadata().is_ok_and(|m| m.len() == total) {
+        // A file of this name that doesn't end with our token was created by
+        // another download after this resume point was saved.
+        if !file.metadata().is_ok_and(|m| m.len() == total + TOKEN_LEN as u64) || !has_token(&file, &token) {
             return Err(r);
         }
         let file_name = r.file_path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
@@ -509,6 +641,7 @@ impl Setup {
             request_url: url,
             part_path: r.part_path(),
             file,
+            token,
             table: SegmentTable::from_segments(r.segments, opts.min_split),
             info: FileInfo {
                 file_name,
@@ -566,11 +699,11 @@ impl Setup {
     ) -> Result<(Self, reqwest::Response)> {
         let timeout = head_timeout(&opts.net);
         let send = |range: bool| {
-            let mut rb = client.get(url.clone()).headers(headers.clone());
+            let mut extra = HeaderMap::new();
             if range {
-                rb = rb.header(header::RANGE, "bytes=0-");
+                extra.insert(header::RANGE, HeaderValue::from_static("bytes=0-"));
             }
-            tokio::time::timeout(timeout, rb.send())
+            tokio::time::timeout(timeout, fetch(client, &url, &url, headers, extra, opts.net.max_redirects))
         };
         let stalled = |_| Error::Stalled(timeout.as_secs());
         let mut resp = send(true).await.map_err(stalled)??;
@@ -620,9 +753,13 @@ impl Setup {
         }
 
         std::fs::create_dir_all(&req.dir)?;
-        let file_path = naming::unique_path(&req.dir, &name, PART_SUFFIX);
-        let part_path = naming::with_suffix(&file_path, PART_SUFFIX);
-        let file = fileio::create_preallocated(&part_path, total)?;
+        let token = new_token()?;
+        let (file_path, part_path, file) = create_part(&req.dir, &name)?;
+        if let Err(e) = prepare_part(&file, &req.dir, total, resumable, &token) {
+            drop(file);
+            let _ = std::fs::remove_file(&part_path);
+            return Err(e);
+        }
         let file_name = file_path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or(name);
 
         let min_split = if resumable { opts.min_split } else { u64::MAX / 4 };
@@ -632,6 +769,7 @@ impl Setup {
                 request_url: final_url.clone(),
                 file,
                 part_path,
+                token,
                 table,
                 info: FileInfo {
                     file_name,
@@ -647,6 +785,90 @@ impl Setup {
             resp,
         ))
     }
+}
+
+/// Create the partial file for a download named `name` in `dir`, numbering
+/// the name as needed. `create_new`: two downloads that pick the same name at
+/// the same moment never share a file. Returns the destination, the partial
+/// file's path and the file.
+fn create_part(dir: &Path, name: &str) -> Result<(PathBuf, PathBuf, File)> {
+    let mut attempts = 0;
+    loop {
+        let file_path = naming::unique_path(dir, name, PART_SUFFIX);
+        let part_path = naming::with_suffix(&file_path, PART_SUFFIX);
+        match OpenOptions::new().read(true).write(true).create_new(true).open(&part_path) {
+            Ok(file) => return Ok((file_path, part_path, file)),
+            // Taken since `unique_path` looked; it skips that name now.
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists && attempts < 100 => attempts += 1,
+            Err(e) => return Err(e.into()),
+        }
+    }
+}
+
+/// Size a fresh partial file for `total` bytes. A resumable download gets its
+/// token at the end right away, so its file can be told apart from another
+/// download's even after a crash; other downloads add it when they stop.
+fn prepare_part(file: &File, dir: &Path, total: Option<u64>, resumable: bool, token: &[u8; TOKEN_LEN]) -> Result<()> {
+    let Some(total) = total else { return Ok(()) };
+    fileio::set_sparse(file, true);
+    let sparse = is_sparse(file);
+    if !sparse {
+        // Without sparse support (FAT32, exFAT, some shares) the size the
+        // server declares is allocated for real: don't let it claim more
+        // than the disk holds.
+        ensure_space(dir, total + TOKEN_LEN as u64)?;
+    }
+    if resumable {
+        write_token(file, total, token)?;
+    } else if sparse {
+        // One connection writes from the start, so only sparse files gain
+        // anything from being sized up front.
+        file.set_len(total)?;
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn is_sparse(file: &File) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_SPARSE_FILE;
+    file.metadata().is_ok_and(|m| m.file_attributes() & FILE_ATTRIBUTE_SPARSE_FILE != 0)
+}
+
+/// Unix filesystems create holes when a file is extended.
+#[cfg(not(windows))]
+fn is_sparse(_file: &File) -> bool {
+    true
+}
+
+fn ensure_space(dir: &Path, needed: u64) -> Result<()> {
+    match free_space(dir) {
+        Some(available) if needed > available => Err(Error::DiskFull { needed, available }),
+        _ => Ok(()),
+    }
+}
+
+/// Bytes the current user may still write to the volume holding `dir`.
+#[cfg(windows)]
+fn free_space(dir: &Path) -> Option<u64> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
+    // A share's root must end with a backslash; any other folder may.
+    let mut wide: Vec<u16> = dir.as_os_str().encode_wide().collect();
+    if wide.last() != Some(&u16::from(b'\\')) {
+        wide.push(u16::from(b'\\'));
+    }
+    wide.push(0);
+    let mut available = 0u64;
+    // SAFETY: `wide` is NUL-terminated and outlives the call; the two other
+    // outputs are optional.
+    let ok = unsafe { GetDiskFreeSpaceExW(wide.as_ptr(), &mut available, std::ptr::null_mut(), std::ptr::null_mut()) };
+    (ok != 0).then_some(available)
+}
+
+#[cfg(not(windows))]
+fn free_space(_dir: &Path) -> Option<u64> {
+    None
 }
 
 /// Shared write path of one download.
@@ -677,7 +899,11 @@ fn recycle(pool: &Mutex<Vec<Vec<u8>>>, mut buf: Vec<u8>) {
 
 struct Ctx {
     url: Url,
+    /// The URL the credentials in `headers` were collected for.
+    origin: Url,
     headers: HeaderMap,
+    /// Marks the partial file as this download's.
+    token: [u8; TOKEN_LEN],
     writer: Writer,
     /// Second handle used for flushing, so a flush never blocks writers that
     /// are serialized on the main handle.
@@ -813,20 +1039,21 @@ impl Ctx {
             }
             (seg.pos(), seg.end)
         };
-        let mut rb = client.get(self.url.clone()).headers(self.headers.clone());
+        let mut extra = HeaderMap::new();
         if self.info.resumable {
             let range = match (end, self.info.total) {
                 (UNKNOWN_END, _) | (_, None) => format!("bytes={offset}-"),
                 (end, Some(total)) => format!("bytes={offset}-{}", (end + OVERLAP).min(total) - 1),
             };
-            rb = rb.header(header::RANGE, range);
+            extra.insert(header::RANGE, HeaderValue::from_str(&range).expect("a byte range is a valid header value"));
             if let Some(v) = self.validator().and_then(|v| HeaderValue::from_str(v).ok()) {
-                rb = rb.header(header::IF_RANGE, v);
+                extra.insert(header::IF_RANGE, v);
             }
         }
         let timeout = self.read_timeout();
+        let send = fetch(client, &self.url, &self.origin, &self.headers, extra, self.opts.net.max_redirects);
         let resp = tokio::select! {
-            r = tokio::time::timeout(timeout, rb.send()) => r.map_err(|_| Error::Stalled(timeout.as_secs()))??,
+            r = tokio::time::timeout(timeout, send) => r.map_err(|_| Error::Stalled(timeout.as_secs()))??,
             _ = self.stop.cancelled() => return Ok(None),
         };
         let etag_changed = |resp: &reqwest::Response| {
@@ -1021,6 +1248,7 @@ impl Ctx {
             etag: self.etag.clone(),
             last_modified: self.last_modified.clone(),
             segments,
+            part_token: Some(hex::encode(self.token)),
         }
     }
 
@@ -1039,8 +1267,22 @@ impl Ctx {
 
     async fn final_checkpoint(&self) {
         let file = self.writer.file.clone();
-        let segments = self.progress.table.lock().snapshot();
-        let _ = tokio::task::spawn_blocking(move || file.sync_data()).await;
+        let (segments, written) = {
+            let t = self.progress.table.lock();
+            (t.snapshot(), t.written())
+        };
+        // A resumable file has carried its token from the start. Any other
+        // gets it now, after the bytes written from its start: there it costs
+        // nothing even where files can't be sparse, and lets the next run
+        // tell that this file is its own to delete.
+        let mark = (!self.info.resumable).then_some((written, self.token));
+        let _ = tokio::task::spawn_blocking(move || {
+            if let Some((at, token)) = mark {
+                let _ = write_token(&file, at, &token);
+            }
+            file.sync_data()
+        })
+        .await;
         self.publish_checkpoint(segments);
     }
 }
@@ -1332,8 +1574,13 @@ async fn finish(ctx: Arc<Ctx>) -> Result<Outcome> {
     let expected = ctx.opts.expected_sha256.clone();
     let file_path = ctx.info.file_path.clone();
     let part_path = naming::with_suffix(&file_path, PART_SUFFIX);
+    let token = ctx.token;
+    let start_over = ctx.resume_data(Vec::new()).start_over();
+    let host_url = ctx.info.final_url.clone();
+    let referrer = header_str(&ctx.headers, header::REFERER).map(str::to_string);
 
     let file = ctx.writer.file.clone();
+    // Cutting the file to its size also drops the token.
     tokio::task::spawn_blocking(move || -> std::io::Result<()> {
         file.set_len(size)?;
         file.sync_all()?;
@@ -1344,6 +1591,28 @@ async fn finish(ctx: Arc<Ctx>) -> Result<Outcome> {
     .map_err(|e| Error::Other(e.to_string()))??;
     drop(ctx); // closes every handle so the file can be renamed
 
+    // Verify before the rename: a file that fails must never sit under its
+    // final name, where it looks like a finished download.
+    if let Some(expected) = expected {
+        progress.set_phase(Phase::Verifying);
+        let path = part_path.clone();
+        let actual = tokio::task::spawn_blocking(move || sha256_file(&path))
+            .await
+            .map_err(|e| Error::Other(e.to_string()))??;
+        if !actual.eq_ignore_ascii_case(expected.trim()) {
+            let _ = std::fs::remove_file(&part_path);
+            *progress.checkpoint.lock() = Some(start_over);
+            return Err(Error::Checksum { expected, actual });
+        }
+    }
+
+    // As browsers do, so that SmartScreen, Office and the like treat the file
+    // as coming from the internet. Volumes without alternate data streams
+    // (FAT32, exFAT) can't hold the mark; the download stands anyway.
+    if let Err(e) = fileio::mark_from_internet(&part_path, &host_url, referrer.as_deref()) {
+        tracing::info!(path = %part_path.display(), error = %e, "cannot record where the file came from");
+    }
+
     let target = if file_path.exists() {
         let dir = file_path.parent().map(PathBuf::from).unwrap_or_default();
         let name = file_path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
@@ -1351,26 +1620,18 @@ async fn finish(ctx: Arc<Ctx>) -> Result<Outcome> {
     } else {
         file_path.clone()
     };
-    // On failure the (complete) checkpoint is kept, so a resume only has to
-    // retry this step.
-    rename_with_retry(&part_path, &target).await?;
+    if let Err(e) = rename_with_retry(&part_path, &target).await {
+        // The (complete) checkpoint is kept, so a resume only has to retry
+        // this step; it needs the token back to recognise the file.
+        let _ = fileio::open_partial(&part_path).and_then(|f| write_token(&f, size, &token));
+        return Err(e.into());
+    }
     *progress.checkpoint.lock() = None;
     if target != file_path
         && let Some(info) = progress.info.lock().as_mut()
     {
         info.file_name = target.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
         info.file_path = target.clone();
-    }
-
-    if let Some(expected) = expected {
-        progress.set_phase(Phase::Verifying);
-        let path = target.clone();
-        let actual = tokio::task::spawn_blocking(move || sha256_file(&path))
-            .await
-            .map_err(|e| Error::Other(e.to_string()))??;
-        if !actual.eq_ignore_ascii_case(expected.trim()) {
-            return Err(Error::Checksum { expected, actual });
-        }
     }
     Ok(Outcome::Completed { path: target, size })
 }
@@ -1483,5 +1744,70 @@ mod tests {
         assert_eq!(backoff(2), Duration::from_millis(500));
         assert!(backoff(5) < backoff(6));
         assert_eq!(backoff(40), Duration::from_secs(30));
+    }
+
+    fn temp_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("spate-download-{tag}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn only_a_part_file_with_our_token_is_discarded() {
+        let dir = temp_dir("token");
+        let mine = new_token().unwrap();
+        let r = ResumeData {
+            final_url: "https://example.com/f.bin".into(),
+            file_path: dir.join("f.bin"),
+            total: Some(10),
+            resumable: true,
+            etag: None,
+            last_modified: None,
+            segments: vec![Segment { start: 0, end: 10, done: 4 }],
+            part_token: Some(hex::encode(mine)),
+        };
+        let mark = |token: &[u8; TOKEN_LEN]| {
+            let f = OpenOptions::new().write(true).create(true).truncate(true).open(r.part_path()).unwrap();
+            write_token(&f, 10, token).unwrap();
+        };
+        // Another download's file under the same name.
+        mark(&new_token().unwrap());
+        assert!(!discard_part(&r));
+        assert!(!discard_part(&r.start_over()), "a fresh start claims no file");
+        assert!(r.part_path().exists());
+        mark(&mine);
+        assert_eq!(std::fs::metadata(r.part_path()).unwrap().len(), 10 + TOKEN_LEN as u64);
+        assert!(!discard_part(&r.start_over()));
+        assert!(discard_part(&r));
+        assert!(!r.part_path().exists());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn resume_data_without_a_token_still_loads() {
+        let json = r#"{"final_url":"https://example.com/f.bin","file_path":"f.bin","total":10,"resumable":true,
+            "etag":null,"last_modified":null,"segments":[{"start":0,"end":10,"done":4}]}"#;
+        let r: ResumeData = serde_json::from_str(json).unwrap();
+        assert_eq!((r.written(), r.part_token), (4, None));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn declared_sizes_must_fit_on_the_volume() {
+        let dir = temp_dir("space");
+        ensure_space(&dir, 1).unwrap();
+        match ensure_space(&dir, u64::MAX / 2) {
+            Err(e @ Error::DiskFull { available, .. }) => {
+                assert!(available > 0);
+                assert!(e.to_string().starts_with("not enough disk space: the file needs 8388608.0 TiB"), "{e}");
+            }
+            other => panic!("expected a disk-full error, got {other:?}"),
+        }
+        // Temp folders are on NTFS, where the fast path applies.
+        let f = OpenOptions::new().read(true).write(true).create(true).truncate(true).open(dir.join("s.part")).unwrap();
+        fileio::set_sparse(&f, true);
+        assert!(is_sparse(&f));
+        drop(f);
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
