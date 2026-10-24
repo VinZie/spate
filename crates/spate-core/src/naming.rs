@@ -59,41 +59,108 @@ pub fn extension_for_mime(mime: &str) -> Option<&'static str> {
     })
 }
 
+/// Longest name [`sanitize`] returns, in bytes (well under the 255 UTF-16
+/// units NTFS allows, leaving room for ` (2)` and `.part`).
+const MAX_NAME_BYTES: usize = 200;
+/// Longest extension kept whole when a name has to be shortened.
+const MAX_EXT_BYTES: usize = 32;
+
 /// Make a name safe for every mainstream filesystem (Windows being the
 /// strictest): no separators or reserved characters, no reserved device
 /// names, no trailing dots/spaces, bounded length.
+///
+/// It also makes the name read the way it will be saved: bidi controls and
+/// other invisible characters are removed (they can show `exe.pdf` for a
+/// file that ends in `.exe`), and runs of spaces become one space so that
+/// padding cannot push the real extension out of view.
 pub fn sanitize(name: &str) -> String {
-    let mut out: String = name
-        .chars()
-        .map(|c| match c {
+    let mut out = String::with_capacity(name.len());
+    for c in name.chars() {
+        let c = match c {
             '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*' => '_',
             c if c.is_control() => '_',
+            c if is_invisible(c) => continue,
+            c if c.is_whitespace() || is_blank(c) => ' ',
             c => c,
-        })
-        .collect();
-    let trimmed = out.trim_end_matches(['.', ' ']).trim_start().to_string();
-    out = if trimmed.is_empty() { "download".to_string() } else { trimmed };
-
-    let stem = out.split('.').next().unwrap_or("").to_ascii_uppercase();
-    const RESERVED: &[&str] = &[
-        "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
-        "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
-    ];
-    if RESERVED.contains(&stem.as_str()) {
+        };
+        if c == ' ' && out.ends_with(' ') {
+            continue;
+        }
+        out.push(c);
+    }
+    out = trim_name(&out);
+    if is_reserved(&out) {
         out.insert(0, '_');
     }
 
-    const MAX_BYTES: usize = 200;
-    if out.len() > MAX_BYTES {
+    if out.len() > MAX_NAME_BYTES {
         let (stem, ext) = split_ext(&out);
-        let keep = MAX_BYTES.saturating_sub(ext.len() + 1);
-        let mut cut = keep.min(stem.len());
-        while !stem.is_char_boundary(cut) {
-            cut -= 1;
-        }
-        out = if ext.is_empty() { stem[..cut].to_string() } else { format!("{}.{ext}", &stem[..cut]) };
+        out = if !ext.is_empty() && ext.len() <= MAX_EXT_BYTES {
+            format!("{}.{ext}", truncate_bytes(stem, MAX_NAME_BYTES - ext.len() - 1))
+        } else {
+            // An extension cut short could turn into another one (`.exe`
+            // from `.exe_and_more`), so a name shortened this way keeps none.
+            truncate_bytes(&out.replace('.', "_"), MAX_NAME_BYTES).to_string()
+        };
+        out = trim_name(&out);
     }
     out
+}
+
+/// Without leading spaces and trailing dots/spaces (Windows drops those),
+/// or `download` if nothing is left.
+fn trim_name(name: &str) -> String {
+    let trimmed = name.trim_end_matches(['.', ' ']).trim_start_matches(' ');
+    if trimmed.is_empty() { "download".to_string() } else { trimmed.to_string() }
+}
+
+fn truncate_bytes(s: &str, max: usize) -> &str {
+    let mut cut = max.min(s.len());
+    while !s.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    &s[..cut]
+}
+
+/// Format characters that render as nothing or reorder the text around
+/// them: bidi controls, zero-width characters, joiners, the BOM, soft
+/// hyphens, invisible math operators and tag characters.
+fn is_invisible(c: char) -> bool {
+    matches!(
+        c,
+        '\u{00AD}'
+            | '\u{034F}'
+            | '\u{061C}'
+            | '\u{115F}'
+            | '\u{1160}'
+            | '\u{17B4}'
+            | '\u{17B5}'
+            | '\u{180B}'..='\u{180F}'
+            | '\u{200B}'..='\u{200F}'
+            | '\u{202A}'..='\u{202E}'
+            | '\u{2060}'..='\u{206F}'
+            | '\u{FEFF}'
+            | '\u{FFF9}'..='\u{FFFB}'
+            | '\u{1D173}'..='\u{1D17A}'
+            | '\u{E0000}'..='\u{E007F}'
+    )
+}
+
+/// Characters that are not whitespace but draw as an empty space.
+fn is_blank(c: char) -> bool {
+    matches!(c, '\u{2800}' | '\u{3164}' | '\u{FFA0}')
+}
+
+/// Whether Windows treats `name` as a device (`CON`, `COM1`, `LPT²`...),
+/// whatever extension follows and with trailing spaces ignored.
+fn is_reserved(name: &str) -> bool {
+    const RESERVED: &[&str] = &[
+        "CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$", "COM0", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6",
+        "COM7", "COM8", "COM9", "COM¹", "COM²", "COM³", "LPT0", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6",
+        "LPT7", "LPT8", "LPT9", "LPT¹", "LPT²", "LPT³",
+    ];
+    let device = name.split('.').next().unwrap_or("").trim_end_matches(' ').to_ascii_uppercase();
+    RESERVED.contains(&device.as_str())
 }
 
 /// `dir/name`, or `dir/name (2).ext` etc. if that (or its partial-download
@@ -222,11 +289,79 @@ mod tests {
     #[test]
     fn sanitizing() {
         assert_eq!(sanitize("a<b>c:d.txt"), "a_b_c_d.txt");
-        assert_eq!(sanitize("con.txt"), "_con.txt");
         assert_eq!(sanitize("name. . "), "name");
         assert_eq!(sanitize(""), "download");
+        assert_eq!(sanitize(" \u{3000} "), "download");
+        assert_eq!(sanitize("tab\there.txt"), "tab_here.txt");
         let long = format!("{}.mp4", "x".repeat(500));
         let s = sanitize(&long);
         assert!(s.len() <= 200 && s.ends_with(".mp4"));
+    }
+
+    #[test]
+    fn reserved_device_names() {
+        for name in [
+            "con.txt", "CON", "con .txt", "CON   .txt", "nul.tar.gz", "Aux.", "COM0.log", "com9", "COM¹.txt", "com².txt",
+            "COM³", "LPT¹.txt", "lpt².txt", "LPT³", "LPT0", "conin$", "CONIN$.txt", "CONOUT$", "conout$ .log",
+        ] {
+            let s = sanitize(name);
+            assert!(s.starts_with('_'), "{name:?} -> {s:?}");
+        }
+        assert_eq!(sanitize("CON .txt"), "_CON .txt");
+        for name in ["console.txt", "COM10.txt", "LPT.txt", "conin.txt", "nul_.txt", "my con.txt"] {
+            assert_eq!(sanitize(name), name);
+        }
+    }
+
+    #[test]
+    fn invisible_and_bidi_characters_are_removed() {
+        // Displayed as "invoiceexe.doc" while the U+202E is in it.
+        assert_eq!(sanitize("invoice\u{202E}cod.exe"), "invoicecod.exe");
+        for c in ['\u{202A}', '\u{202B}', '\u{202C}', '\u{202D}', '\u{2066}', '\u{2067}', '\u{2068}', '\u{2069}'] {
+            assert_eq!(sanitize(&format!("a{c}b.pdf")), "ab.pdf", "U+{:04X}", c as u32);
+        }
+        for c in ['\u{200E}', '\u{200F}', '\u{061C}', '\u{200B}', '\u{200C}', '\u{200D}', '\u{2060}', '\u{FEFF}', '\u{00AD}'] {
+            assert_eq!(sanitize(&format!("a{c}b.pdf")), "ab.pdf", "U+{:04X}", c as u32);
+        }
+        assert_eq!(sanitize("\u{FEFF}report.pdf\u{200B}"), "report.pdf");
+        assert_eq!(sanitize("€ rates.pdf"), "€ rates.pdf");
+    }
+
+    #[test]
+    fn whitespace_runs_collapse() {
+        let padded = format!("invoice.pdf{}.exe", " ".repeat(150));
+        assert_eq!(sanitize(&padded), "invoice.pdf .exe");
+        assert_eq!(sanitize("a \u{00A0}\u{2003}\u{3000}\u{2800}\u{3164} b.txt"), "a b.txt");
+        assert_eq!(sanitize("  lead and   trail  .txt  "), "lead and trail .txt");
+    }
+
+    #[test]
+    fn length_cap_holds() {
+        let cases = [
+            format!("a.{}", "x".repeat(500)),
+            format!(".{}", "x".repeat(500)),
+            format!("{}.{}", "y".repeat(300), "x".repeat(300)),
+            format!("{}.mp4", "é".repeat(300)),
+            format!("{}.mp4", "x".repeat(199)),
+            format!("CON.{}", "x".repeat(198)),
+            "a.".repeat(300),
+            format!("{} .{}", "x".repeat(198), "y".repeat(40)),
+            format!("{}\u{202E}.txt", "x".repeat(400)),
+        ];
+        for name in &cases {
+            let s = sanitize(name);
+            assert!(s.len() <= 200, "{} bytes from {} bytes", s.len(), name.len());
+            assert!(!s.ends_with(['.', ' ']) && !s.is_empty(), "{s:?}");
+            assert_eq!(sanitize(&s), s, "sanitizing is idempotent");
+        }
+        // A long extension is not cut down into a different one.
+        let tricky = format!("{}.exe.{}", "a".repeat(196), "b".repeat(100));
+        let s = sanitize(&tricky);
+        assert!(s.len() <= 200 && split_ext(&s).1.is_empty(), "{s:?}");
+        let tricky = format!("{}.exe{}", "a".repeat(196), "b".repeat(100));
+        assert!(!sanitize(&tricky).to_ascii_lowercase().ends_with(".exe"));
+        // A short one is always kept.
+        let s = sanitize(&format!("{}.tar.gz", "n".repeat(400)));
+        assert!(s.len() == 200 && s.ends_with(".gz"), "{s}");
     }
 }

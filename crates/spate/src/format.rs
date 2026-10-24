@@ -114,6 +114,26 @@ pub fn now_unix() -> u64 {
         .unwrap_or(0)
 }
 
+/// `name` cut to at most `max_chars` characters by replacing its middle with
+/// `…`. The end, with the extension, is always kept: a long name must not
+/// hide that it ends in `.exe`.
+pub fn middle_ellipsis(name: &str, max_chars: usize) -> String {
+    let chars: Vec<char> = name.chars().collect();
+    if chars.len() <= max_chars {
+        return name.to_string();
+    }
+    let ext = name.rfind('.').filter(|&i| i > 0).map_or(0, |i| name[i..].chars().count());
+    let room = max_chars.saturating_sub(1);
+    // The extension plus a few characters before it, or a third of the room.
+    let tail = if (2..=16).contains(&ext) { (ext + 4).max(room / 3) } else { room / 2 };
+    let tail = tail.min(chars.len());
+    let head = room.saturating_sub(tail);
+    let mut out: String = chars[..head].iter().collect();
+    out.push('…');
+    out.extend(&chars[chars.len() - tail..]);
+    out
+}
+
 /// Speed limit label for KiB/s settings (0 = unlimited).
 pub fn limit_kib(kib: u64) -> String {
     if kib == 0 { "Unlimited".into() } else { speed(kib as f64 * 1024.0) }
@@ -171,6 +191,23 @@ mod tests {
     fn progress_text() {
         assert_eq!(progress_of(1024, Some(4096)), "1.00 KB of 4.00 KB");
         assert_eq!(progress_of(1024, None), "1.00 KB");
+    }
+
+    #[test]
+    fn long_names_keep_their_extension() {
+        assert_eq!(middle_ellipsis("short.pdf", 20), "short.pdf");
+        assert_eq!(middle_ellipsis("a-very-long-invoice-name-2026-final.pdf", 20), "a-very-long…inal.pdf");
+        let padded = format!("invoice.pdf{}.exe", "_".repeat(80));
+        for max in [8, 12, 20, 40, 60] {
+            let s = middle_ellipsis(&padded, max);
+            assert!(s.ends_with(".exe"), "{s}");
+            assert!(s.chars().count() <= max.max(9), "{s}");
+        }
+        // No usable extension: the end is still shown.
+        assert_eq!(middle_ellipsis(&"x".repeat(30), 11), "xxxxx…xxxxx");
+        assert_eq!(middle_ellipsis("é".repeat(10).as_str(), 5), "éé…éé");
+        // However little room there is.
+        assert_eq!(middle_ellipsis("anything.zip", 0), "…hing.zip");
     }
 
     #[test]

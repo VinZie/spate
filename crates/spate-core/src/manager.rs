@@ -29,7 +29,7 @@
 //! * A queue download that fails is retried a few times with back-off before
 //!   it is marked [`Status::Failed`].
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -145,9 +145,22 @@ pub struct AddRequest {
 pub struct DownloadRecord {
     pub id: u64,
     pub url: String,
+    /// Request headers. Credentials among them (cookies, `Authorization`,
+    /// see [`is_credential_header`]) live in memory for this session only and
+    /// are never written to `downloads.json`: the browser keeps cookies
+    /// encrypted, and a plain-text copy would undo that against infostealers.
+    /// A download that needed them and is resumed after a restart goes on
+    /// without them, which may fail; sending it again from the browser
+    /// supplies fresh ones.
+    #[serde(serialize_with = "serialize_without_credentials")]
     pub headers: Vec<(String, String)>,
     pub kind: DownloadKind,
     pub file_name: String,
+    /// `file_name` was chosen (confirmed in a dialog, given on the command
+    /// line or by the browser), so the server's suggestion must not
+    /// replace it.
+    #[serde(default)]
+    pub name_chosen: bool,
     pub dir: PathBuf,
     /// Final path once known (after the first response).
     pub file_path: Option<PathBuf>,
@@ -364,6 +377,12 @@ impl Manager {
         let mut resume_now = Vec::new();
         let mut converted = false;
         for rec in &mut records {
+            // Lists saved by older versions still hold credentials; the next
+            // save drops them from the file.
+            if rec.headers.iter().any(|(name, _)| is_credential_header(name)) {
+                rec.headers.retain(|(name, _)| !is_credential_header(name));
+                converted = true;
+            }
             if rec.status.is_active() {
                 if settings.resume_on_launch {
                     resume_now.push((rec.id, rec.queued));
@@ -431,13 +450,9 @@ impl Manager {
         let inner = &self.inner;
         let url = req.url.trim().to_string();
         let kind = req.kind.unwrap_or_else(|| detect_kind(&url));
-        let file_name = req
-            .file_name
-            .as_deref()
-            .map(str::trim)
-            .filter(|n| !n.is_empty())
-            .map(naming::sanitize)
-            .unwrap_or_else(|| default_name(&url, kind));
+        let chosen = req.file_name.as_deref().map(str::trim).filter(|n| !n.is_empty()).map(naming::sanitize);
+        let name_chosen = chosen.is_some();
+        let file_name = chosen.unwrap_or_else(|| default_name(&url, kind));
         let category = Category::for_file_name(&file_name);
         let queued = req.start == StartMode::Queue;
         let id = {
@@ -452,6 +467,7 @@ impl Manager {
                 headers: req.headers,
                 kind,
                 file_name,
+                name_chosen,
                 dir,
                 file_path: None,
                 category,
@@ -553,7 +569,7 @@ impl Manager {
             let rec = st.records.remove(idx);
             st.retries.remove(&id);
             st.mark_dirty(SAVE_SOON);
-            let files = if delete_file { files_of(&rec) } else { Vec::new() };
+            let files = if delete_file { owned_files(&rec, &paths_in_use(st, id), true) } else { Vec::new() };
             if st.request_stop(id, StopReason::Remove { delete_file }) {
                 // Deleted by the task's completion handler once its file
                 // handles are closed.
@@ -585,8 +601,10 @@ impl Manager {
             st.retries.remove(&id);
             if st.request_stop(id, StopReason::Restart) {
                 true
-            } else if let Some(rec) = st.record_mut(id) {
-                let parts = part_files(rec);
+            } else if let Some(idx) = st.records.iter().position(|r| r.id == id) {
+                let in_use = paths_in_use(st, id);
+                let rec = &mut st.records[idx];
+                let parts = owned_files(rec, &in_use, false);
                 reset_progress(rec);
                 delete_files(&parts);
                 st.mark_dirty(SAVE_SOON);
@@ -882,6 +900,7 @@ impl Inner {
             let checkpoint = run.progress.checkpoint();
             let info = run.progress.info();
             let received = run.progress.received();
+            let in_use = if run.stop == Some(StopReason::Restart) { paths_in_use(st, id) } else { HashSet::new() };
 
             if let Some(StopReason::Remove { delete_file }) = run.stop {
                 if delete_file {
@@ -897,7 +916,7 @@ impl Inner {
                     apply_info(rec, info);
                 }
                 if run.stop == Some(StopReason::Restart) {
-                    let mut parts = part_files(rec);
+                    let mut parts = owned_files(rec, &in_use, false);
                     parts.extend(checkpoint.map(|c| c.part_path()));
                     reset_progress(rec);
                     delete_files(&parts);
@@ -1294,15 +1313,59 @@ fn part_files(rec: &DownloadRecord) -> Vec<PathBuf> {
     files
 }
 
-/// Every file on disk that belongs to `rec`.
-fn files_of(rec: &DownloadRecord) -> Vec<PathBuf> {
-    let mut files = part_files(rec);
-    if rec.status == Status::Completed
+/// The sidecar `spate-cli get` keeps next to a partial file.
+const SIDECAR_SUFFIX: &str = ".json";
+
+/// The files on disk that belong to `rec`: its partial file, with the
+/// sidecar of an interrupted `spate-cli get` of the same address if there is
+/// one, and with `with_final` the file of a completed download. Paths that
+/// another download also uses (`in_use`) are never included, nor a partial
+/// file whose sidecar describes another address.
+fn owned_files(rec: &DownloadRecord, in_use: &HashSet<PathBuf>, with_final: bool) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    for part in part_files(rec) {
+        let sidecar = naming::with_suffix(&part, SIDECAR_SUFFIX);
+        match sidecar_is_for(&sidecar, rec) {
+            Some(true) => files.extend([part, sidecar]),
+            Some(false) => {}
+            None => files.push(part),
+        }
+    }
+    if with_final
+        && rec.status == Status::Completed
         && let Some(p) = &rec.file_path
     {
         files.push(p.clone());
     }
+    files.retain(|p| !in_use.contains(p));
     files
+}
+
+/// Whether the sidecar at `path` describes `rec`'s download; `None` if there
+/// is none or it cannot be read.
+fn sidecar_is_for(path: &Path, rec: &DownloadRecord) -> Option<bool> {
+    let json: serde_json::Value = serde_json::from_slice(&std::fs::read(path).ok()?).ok()?;
+    let theirs = [json["url"].as_str(), json["resume"]["final_url"].as_str()];
+    let ours = [Some(rec.url.as_str()), rec.resume.as_ref().map(|r| r.final_url.as_str())];
+    Some(theirs.iter().flatten().any(|t| ours.iter().flatten().any(|o| o.trim() == t.trim())))
+}
+
+/// Every path the downloads other than `id` point at, including what their
+/// running engines are writing.
+fn paths_in_use(st: &State, id: u64) -> HashSet<PathBuf> {
+    let mut used = HashSet::new();
+    for rec in st.records.iter().filter(|r| r.id != id) {
+        used.extend(part_files(rec));
+        used.extend(rec.file_path.iter().cloned());
+    }
+    for run in st.running.iter().filter(|(other, _)| **other != id).map(|(_, run)| run) {
+        if let Some(info) = run.progress.info() {
+            used.insert(naming::with_suffix(&info.file_path, PART_SUFFIX));
+            used.insert(info.file_path);
+        }
+        used.extend(run.progress.checkpoint().map(|c| c.part_path()));
+    }
+    used
 }
 
 fn delete_files(paths: &[PathBuf]) {
@@ -1324,11 +1387,26 @@ fn default_name(url: &str, kind: DownloadKind) -> String {
     }
 }
 
-/// The name to force on the engine: only one the user chose (anything other
-/// than the URL-derived default), so the server's `Content-Disposition` name
-/// wins otherwise.
+/// The name to force on the engine: one that was chosen, even if it equals
+/// the URL-derived default (the name confirmed in a dialog must be the name
+/// saved), or one an earlier run already settled on. Otherwise the server's
+/// `Content-Disposition` name wins.
 fn requested_name(rec: &DownloadRecord) -> Option<String> {
-    (rec.file_name != default_name(&rec.url, rec.kind)).then(|| rec.file_name.clone())
+    (rec.name_chosen || rec.file_name != default_name(&rec.url, rec.kind)).then(|| rec.file_name.clone())
+}
+
+/// Request headers that carry credentials and are therefore never saved.
+pub fn is_credential_header(name: &str) -> bool {
+    const MARKERS: [&str; 10] = ["cookie", "auth", "token", "secret", "session", "password", "api-key", "apikey", "csrf", "xsrf"];
+    let name = name.trim().to_ascii_lowercase();
+    MARKERS.iter().any(|m| name.contains(m))
+}
+
+fn serialize_without_credentials<S: serde::Serializer>(
+    headers: &[(String, String)],
+    s: S,
+) -> std::result::Result<S::Ok, S::Error> {
+    s.collect_seq(headers.iter().filter(|(name, _)| !is_credential_header(name)))
 }
 
 /// HLS streams are saved as MPEG-TS.
@@ -1537,7 +1615,8 @@ mod tests {
     }
 
     /// Serve `len` deterministic bytes at every path, honouring `Range`.
-    /// `rate` throttles each connection to that many bytes/s.
+    /// `rate` throttles each connection to that many bytes/s. Paths under
+    /// `/cd/` come with `Content-Disposition: attachment; filename="invoice.exe"`.
     async fn serve(len: usize, rate: Option<usize>) -> Server {
         let data = Arc::new(payload(len));
         let sha = hex::encode(Sha256::digest(&data[..]));
@@ -1580,6 +1659,9 @@ mod tests {
         );
         if range.is_some() {
             resp += &format!("Content-Range: bytes {start}-{}/{len}\r\n", end - 1);
+        }
+        if head.split_whitespace().nth(1).is_some_and(|path| path.starts_with("/cd/")) {
+            resp += "Content-Disposition: attachment; filename=\"invoice.exe\"\r\n";
         }
         resp += "\r\n";
         sock.write_all(resp.as_bytes()).await?;
@@ -1877,6 +1959,9 @@ mod tests {
         assert_eq!(m.item(named).unwrap().file_name, "my_name.iso");
         assert_eq!(requested_name(&record(&m, named)).as_deref(), Some("my_name.iso"));
         assert_eq!(requested_name(&record(&m, zip.id)), None);
+        let same = m.add(AddRequest { file_name: Some("x.zip".into()), ..request("http://h/files/x.zip".into(), StartMode::Paused) });
+        assert_eq!(requested_name(&record(&m, same)).as_deref(), Some("x.zip"), "chosen, though equal to the URL's");
+        m.remove(same, false);
 
         // Unusable URLs fail with a readable error instead of hanging.
         let bad = m.add(request("ftp://h/f.zip".into(), StartMode::Now));
@@ -1894,6 +1979,123 @@ mod tests {
         assert_eq!(m.item(zip.id).unwrap().status, Status::Paused);
         m.shutdown();
         assert_eq!(saved_records(&env).len(), 4);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn confirmed_names_win_over_the_server() {
+        let env = env("names", |_| {});
+        let srv = serve(64 * KIB, None).await;
+        let m = manager(&env);
+        // The confirmed name equals the one in the URL; the server suggests
+        // another. What was confirmed is what gets saved.
+        let url = format!("{}/cd/invoice.pdf", srv.base);
+        let confirmed = m.add(AddRequest { file_name: Some("invoice.pdf".into()), ..request(url.clone(), StartMode::Now) });
+        let v = wait_for(&m, confirmed, "completion", |v| v.status == Status::Completed).await;
+        assert_eq!(v.file_path.unwrap(), env.dl.join("invoice.pdf"));
+        assert_eq!(requested_name(&record(&m, confirmed)).as_deref(), Some("invoice.pdf"));
+        // Without a chosen name the server's name is used, as before.
+        let unnamed = m.add(request(url, StartMode::Now));
+        let v = wait_for(&m, unnamed, "completion", |v| v.status == Status::Completed).await;
+        assert_eq!(v.file_path.unwrap(), env.dl.join("invoice.exe"));
+        m.shutdown();
+        assert!(saved_records(&env).iter().any(|r| r.id == confirmed && r.name_chosen));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn credentials_are_never_saved() {
+        let env = env("creds", |_| {});
+        let headers: Vec<(String, String)> = [
+            ("Cookie", "session=SECRET1"),
+            ("Authorization", "Bearer SECRET2"),
+            ("X-Auth-Token", "SECRET3"),
+            ("Proxy-Authorization", "Basic SECRET4"),
+            ("Referer", "https://site.example/"),
+        ]
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+        let m = manager(&env);
+        let id = m.add(AddRequest { headers: headers.clone(), ..request("http://127.0.0.1:9/f.zip".into(), StartMode::Paused) });
+        assert_eq!(record(&m, id).headers, headers, "kept in memory for this session");
+        m.shutdown();
+        let json = String::from_utf8(std::fs::read(env.data.join(DOWNLOADS_FILE)).unwrap()).unwrap();
+        assert!(!json.contains("SECRET"), "{json}");
+        assert!(json.contains("https://site.example/"));
+        drop(m);
+        // After a restart the download goes on without them.
+        let referer = vec![("Referer".to_string(), "https://site.example/".to_string())];
+        let m = manager(&env);
+        assert_eq!(record(&m, id).headers, referer);
+        m.shutdown();
+        drop(m);
+
+        // A list written by an older version is cleaned up on load.
+        let mut old: Vec<serde_json::Value> = serde_json::from_str(&json).unwrap();
+        old[0]["headers"] = serde_json::json!([["Cookie", "session=SECRET1"], ["Referer", "https://site.example/"]]);
+        std::fs::write(env.data.join(DOWNLOADS_FILE), serde_json::to_vec(&old).unwrap()).unwrap();
+        let m = manager(&env);
+        assert_eq!(record(&m, id).headers, referer);
+        m.shutdown();
+        let json = String::from_utf8(std::fs::read(env.data.join(DOWNLOADS_FILE)).unwrap()).unwrap();
+        assert!(!json.contains("SECRET"), "{json}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn deleting_files_takes_only_the_downloads_own() {
+        let env = env("ownfiles", |_| {});
+        std::fs::create_dir_all(&env.dl).unwrap();
+        let m = manager(&env);
+        let file = |name: &str| env.dl.join(name);
+        let touch = |name: &str, body: &str| std::fs::write(file(name), body).unwrap();
+        let failed_at = |url: &str, name: &str| {
+            let id = m.add(request(url.into(), StartMode::Paused));
+            let mut st = m.inner.state.lock();
+            let rec = st.record_mut(id).unwrap();
+            rec.file_path = Some(file(name));
+            rec.status = Status::Failed;
+            id
+        };
+
+        // A failed download's leftover partial file and its sidecar go.
+        let a = failed_at("http://127.0.0.1:9/a.bin", "a.bin");
+        touch("a.bin.part", "partial");
+        touch("a.bin.part.json", r#"{"spate_sidecar":1,"url":"http://127.0.0.1:9/a.bin","resume":{}}"#);
+        m.remove(a, true);
+        assert!(!file("a.bin.part").exists() && !file("a.bin.part.json").exists());
+
+        // A partial file whose sidecar describes another download stays.
+        let b = failed_at("http://127.0.0.1:9/b.bin", "b.bin");
+        touch("b.bin.part", "someone else's");
+        touch("b.bin.part.json", r#"{"spate_sidecar":1,"url":"https://other.example/b.bin","resume":{}}"#);
+        m.remove(b, true);
+        assert!(file("b.bin.part").exists() && file("b.bin.part.json").exists());
+
+        // A path another download in the list also points at stays.
+        let c = failed_at("http://127.0.0.1:9/c.bin", "c.bin");
+        let d = failed_at("http://127.0.0.1:9/c.bin?again", "c.bin");
+        touch("c.bin.part", "shared");
+        m.remove(c, true);
+        assert!(file("c.bin.part").exists());
+        m.remove(d, true);
+        assert!(!file("c.bin.part").exists());
+
+        // The final name of a download that never completed is not proof
+        // that the file there is its own.
+        let e = failed_at("http://127.0.0.1:9/e.bin", "e.bin");
+        touch("e.bin", "not ours");
+        m.remove(e, true);
+        assert!(file("e.bin").exists());
+        m.shutdown();
+    }
+
+    #[test]
+    fn credential_headers() {
+        for name in ["Cookie", "cookie2", "Authorization", "Proxy-Authorization", "X-Auth-Token", "X-CSRF-Token", "X-Api-Key"] {
+            assert!(is_credential_header(name), "{name}");
+        }
+        for name in ["Referer", "User-Agent", "Accept", "Accept-Language", "Origin", "Range"] {
+            assert!(!is_credential_header(name), "{name}");
+        }
     }
 
     #[test]

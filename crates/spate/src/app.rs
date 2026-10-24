@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::clipwatch::ClipWatcher;
 use crate::dialogs::{
-    AboutDialog, AddDialog, BatchDialog, DeleteDialog, DialogResult, OptionsDialog, OptionsTab, UiOptions, request_from_item,
+    AboutDialog, AddDialog, BatchDialog, DeleteDialog, DialogResult, OptionsDialog, OptionsTab, Source, UiOptions, request_from_item,
 };
 use crate::icons::{self, Icon};
 use crate::theme::{self, ThemeChoice};
@@ -96,6 +96,32 @@ fn status_rank(s: Status) -> u8 {
         Status::Failed => 5,
         Status::Completed => 6,
     }
+}
+
+/// Remove the plain Enter presses from `events`; whether one of them was a
+/// fresh press rather than key repeat (holding Enter down opens nothing).
+fn take_enter(events: &mut Vec<egui::Event>) -> bool {
+    let mut fresh = false;
+    events.retain(|e| match e {
+        egui::Event::Key { key: Key::Enter, pressed: true, repeat, modifiers, .. } if modifiers.matches_logically(Modifiers::NONE) => {
+            fresh |= !repeat;
+            false
+        }
+        _ => true,
+    });
+    fresh
+}
+
+/// Drop key-repeat events of Enter and Space, which also click the focused
+/// button: holding a key down must not confirm a dialog.
+fn drop_held_keys(events: &mut Vec<egui::Event>) {
+    events.retain(|e| !matches!(e, egui::Event::Key { key: Key::Enter | Key::Space, repeat: true, .. }));
+}
+
+/// The download Enter opens in the list: the focused one if it is selected
+/// and the user picked it.
+fn enter_target(focus: Option<u64>, selection: &BTreeSet<u64>, by_user: bool) -> Option<u64> {
+    focus.filter(|id| by_user && selection.contains(id))
 }
 
 fn compare(a: &ItemView, b: &ItemView, key: SortKey) -> std::cmp::Ordering {
@@ -201,6 +227,9 @@ pub struct App {
     selection: BTreeSet<u64>,
     anchor: Option<u64>,
     focus_item: Option<u64>,
+    /// `focus_item` was picked by the user (clicked), not by the app (a
+    /// download just added). Only then does Enter open it.
+    focus_by_user: bool,
     /// Displayed order of rows (indexes into `items`), rebuilt every frame.
     rows: Vec<usize>,
     add_dialog: Option<AddDialog>,
@@ -256,6 +285,7 @@ impl App {
             selection: BTreeSet::new(),
             anchor: None,
             focus_item: None,
+            focus_by_user: false,
             rows: Vec::new(),
             add_dialog: None,
             captures: VecDeque::new(),
@@ -299,8 +329,8 @@ impl App {
                 UiEvent::Completed(id, path) => self.on_completed(ctx, id, path),
                 UiEvent::ClipboardUrl(url) => {
                     if self.add_dialog.is_none() && !self.items.iter().any(|i| i.url == url) {
-                        self.add_dialog = Some(AddDialog::new(url, &self.settings));
-                        self.show_window(ctx);
+                        self.add_dialog = Some(AddDialog::new(url, Source::ClipboardWatch, &self.settings));
+                        self.announce_dialog(ctx);
                     }
                 }
                 UiEvent::HostInstalled(r) => {
@@ -332,6 +362,21 @@ impl App {
         ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
     }
 
+    /// Make a dialog that opened by itself noticeable without taking the
+    /// keyboard focus from whatever the user is typing into (a web page could
+    /// time a download to catch an Enter): the taskbar button flashes, and
+    /// the user switches over when they choose to.
+    fn announce_dialog(&mut self, ctx: &egui::Context) {
+        if self.hidden_to_tray {
+            // A hidden window has no taskbar button; show it, unfocused.
+            self.hidden_to_tray = false;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+        }
+        if !self.window_focused {
+            ctx.send_viewport_cmd(egui::ViewportCommand::RequestUserAttention(egui::UserAttentionType::Critical));
+        }
+    }
+
     fn handle_add(&mut self, ctx: &egui::Context, items: Vec<AddItem>, interactive: bool, start: StartMode) {
         let items: Vec<AddItem> = items.into_iter().filter(|i| urls::is_http_url(&i.url)).collect();
         if items.is_empty() {
@@ -346,11 +391,7 @@ impl App {
             } else {
                 self.batch = Some(BatchDialog::new(items, false, &self.settings));
             }
-            self.show_window(ctx);
-            if !self.window_focused {
-                // Windows may refuse to move focus; flash the taskbar button instead.
-                ctx.send_viewport_cmd(egui::ViewportCommand::RequestUserAttention(egui::UserAttentionType::Critical));
-            }
+            self.announce_dialog(ctx);
         } else {
             let n = items.len();
             for item in &items {
@@ -395,8 +436,11 @@ impl App {
         if self.add_dialog.is_some() {
             return;
         }
-        let clip = arboard::Clipboard::new().and_then(|mut c| c.get_text()).ok().and_then(|t| urls::single_url(&t)).unwrap_or_default();
-        self.add_dialog = Some(AddDialog::new(clip, &self.settings));
+        let clip = arboard::Clipboard::new().and_then(|mut c| c.get_text()).ok().and_then(|t| urls::single_url(&t));
+        self.add_dialog = Some(match clip {
+            Some(url) => AddDialog::new(url, Source::Clipboard, &self.settings),
+            None => AddDialog::new(String::new(), Source::Typed, &self.settings),
+        });
     }
 
     fn open_batch_from_clipboard(&mut self) {
@@ -404,7 +448,7 @@ impl App {
         let found = urls::extract_urls(&text);
         match found.len() {
             0 => self.toast(ToastKind::Info, "Nothing to add", "The clipboard holds no web addresses.".into(), 4),
-            1 => self.add_dialog = Some(AddDialog::new(found.into_iter().next().unwrap_or_default(), &self.settings)),
+            1 => self.add_dialog = Some(AddDialog::new(found.into_iter().next().unwrap_or_default(), Source::Clipboard, &self.settings)),
             _ => self.batch = Some(BatchDialog::from_urls(found, &self.settings)),
         }
     }
@@ -506,6 +550,7 @@ impl App {
                         self.anchor = Some(id);
                     }
                     self.focus_item = Some(id);
+                    self.focus_by_user = true;
                 }
                 Action::ContextSelect(id) => {
                     if !self.selection.contains(&id) {
@@ -514,6 +559,7 @@ impl App {
                         self.anchor = Some(id);
                     }
                     self.focus_item = Some(id);
+                    self.focus_by_user = true;
                 }
                 Action::DoubleClick(id) | Action::Open(id) => self.open_item(id),
                 Action::OpenWith(id) => {
@@ -656,8 +702,8 @@ impl App {
             let ids = self.selected_ids();
             self.request_delete(ids);
         }
-        if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Enter))
-            && let Some(id) = self.focus_item.filter(|id| self.selection.contains(id))
+        if ctx.input_mut(|i| take_enter(&mut i.events))
+            && let Some(id) = enter_target(self.focus_item, &self.selection, self.focus_by_user)
         {
             self.open_item(id);
         }
@@ -1031,7 +1077,13 @@ impl App {
                         if it.queued {
                             ui.label(RichText::new("Q").small().strong().color(theme::WARN)).on_hover_text("In the queue");
                         }
-                        ui.add(egui::Label::new(&it.file_name).truncate().selectable(false));
+                        // Shortened in the middle, so the extension stays in view.
+                        let font = egui::TextStyle::Body.resolve(ui.style());
+                        let name = crate::dialogs::fit_name(ui, &it.file_name, &font, ui.available_width());
+                        let r = ui.add(egui::Label::new(name.as_str()).wrap_mode(egui::TextWrapMode::Truncate).selectable(false));
+                        if name != it.file_name {
+                            r.on_hover_text(&it.file_name);
+                        }
                     });
                     row.col(|ui| {
                         ui.label(format::opt_size(it.total));
@@ -1340,11 +1392,14 @@ impl App {
         }
     }
 
+    /// Select a download the app just added. Enter does not open it until
+    /// the user picks it, so a confirmation cannot turn into opening the file.
     fn select_only(&mut self, id: u64) {
         self.selection.clear();
         self.selection.insert(id);
         self.anchor = Some(id);
         self.focus_item = Some(id);
+        self.focus_by_user = false;
     }
 
     fn toasts_ui(&mut self, ctx: &egui::Context) {
@@ -1462,6 +1517,9 @@ impl eframe::App for App {
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        if self.any_modal() {
+            ctx.input_mut(|i| drop_held_keys(&mut i.events));
+        }
         self.shortcuts(&ctx);
         self.refresh(&ctx);
 
@@ -1693,4 +1751,54 @@ fn empty_state(ui: &mut egui::Ui, actions: &mut Vec<Action>) {
             actions.push(Action::Details(0));
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn key(key: Key, repeat: bool, modifiers: Modifiers) -> egui::Event {
+        egui::Event::Key { key, physical_key: None, pressed: true, repeat, modifiers }
+    }
+
+    #[test]
+    fn held_enter_opens_nothing() {
+        let mut events = vec![key(Key::Enter, true, Modifiers::NONE), key(Key::Enter, true, Modifiers::NONE)];
+        assert!(!take_enter(&mut events));
+        assert!(events.is_empty(), "repeats are swallowed, not passed on");
+
+        let mut events = vec![key(Key::A, false, Modifiers::NONE), key(Key::Enter, false, Modifiers::NONE)];
+        assert!(take_enter(&mut events));
+        assert_eq!(events.len(), 1);
+
+        let mut events = vec![key(Key::Enter, false, Modifiers::COMMAND)];
+        assert!(!take_enter(&mut events));
+        assert_eq!(events.len(), 1, "Ctrl+Enter is left alone");
+    }
+
+    #[test]
+    fn held_keys_cannot_click_dialog_buttons() {
+        let mut events = vec![
+            key(Key::Enter, true, Modifiers::NONE),
+            key(Key::Space, true, Modifiers::NONE),
+            key(Key::Enter, false, Modifiers::NONE),
+            key(Key::A, true, Modifiers::NONE),
+            egui::Event::Text(" ".into()),
+        ];
+        drop_held_keys(&mut events);
+        assert_eq!(
+            events,
+            vec![key(Key::Enter, false, Modifiers::NONE), key(Key::A, true, Modifiers::NONE), egui::Event::Text(" ".into())]
+        );
+    }
+
+    #[test]
+    fn enter_opens_only_what_the_user_picked() {
+        let selection: BTreeSet<u64> = [7].into();
+        assert_eq!(enter_target(Some(7), &selection, true), Some(7));
+        // Just added from a dialog: selected by the app, not opened by Enter.
+        assert_eq!(enter_target(Some(7), &selection, false), None);
+        assert_eq!(enter_target(Some(8), &selection, true), None);
+        assert_eq!(enter_target(None, &selection, true), None);
+    }
 }
