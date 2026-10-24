@@ -220,15 +220,6 @@ Not yet. The engine and command line are written to be portable, but only Window
 - [`SECURITY.md`](SECURITY.md): reporting vulnerabilities
 - [`CHANGELOG.md`](CHANGELOG.md): what changed in each release
 
-## Star history
-
-<a href="https://star-history.com/#VinZie/spate&Date">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=VinZie/spate&type=Date&theme=dark">
-    <img src="https://api.star-history.com/svg?repos=VinZie/spate&type=Date" width="600" alt="Star history chart for this project/spate">
-  </picture>
-</a>
-
 ## Contributing
 
 Bug reports, ideas and pull requests are welcome. Start with [`CONTRIBUTING.md`](CONTRIBUTING.md) for how to build, test and structure a change, and open an issue first for anything large.
