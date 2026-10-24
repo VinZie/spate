@@ -255,3 +255,59 @@ fn native_host_and_add_reach_the_app() {
     drop(server);
     std::fs::remove_dir_all(&data_dir).ok();
 }
+
+/// A program that took over the port of a stale `ipc.json` and does not
+/// know the token. Returns what each connection to it carried.
+fn impostor(data_dir: &Path) -> Arc<Mutex<Vec<String>>> {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let info = ipc::IpcInfo { port: listener.local_addr().unwrap().port(), token: "c3".repeat(24), pid: 1 };
+    std::fs::write(ipc::info_path(data_dir), serde_json::to_vec(&info).unwrap()).unwrap();
+    let seen: Arc<Mutex<Vec<String>>> = Arc::default();
+    let s = seen.clone();
+    std::thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            let s = s.clone();
+            std::thread::spawn(move || {
+                let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(10)));
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut text = String::new();
+                let _ = reader.read_line(&mut text);
+                // Agree to everything, the way an old app would answer.
+                let _ = (&stream).write_all(b"{\"ok\":true,\"error\":null,\"version\":\"0.1.0\",\"proof\":\"00\"}\n");
+                let _ = reader.read_to_string(&mut text);
+                s.lock().unwrap().push(text);
+            });
+        }
+    });
+    seen
+}
+
+#[test]
+fn helpers_tell_an_impostor_nothing() {
+    let data_dir = temp_dir("impostor-data");
+    let seen = impostor(&data_dir);
+    let origin = format!("chrome-extension://{}/", ipc::CHROMIUM_EXTENSION_ID);
+
+    let o = cli(&data_dir, &["add", "https://example.com/a.zip", "--cookie", "session=SECRET", "--silent"]);
+    assert!(!o.status.success(), "{}", text(&o));
+    let input = frame(r#"{"type":"download","items":[{"url":"https://example.com/b.zip","cookies":"session=SECRET"}]}"#);
+    let r = host_session(&data_dir, &[&origin, "--parent-window=0"], &input);
+    assert_eq!(r[0]["ok"], false, "{:?}", r[0]);
+    let o = cli(&data_dir, &["status"]);
+    assert!(text(&o).contains("not running"), "{}", text(&o));
+    let o = cli(&data_dir, &["show"]);
+    assert!(!o.status.success(), "{}", text(&o));
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while seen.lock().unwrap().len() < 4 && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let seen = seen.lock().unwrap().clone();
+    assert_eq!(seen.len(), 4, "one connection per helper run: {seen:?}");
+    for conn in &seen {
+        let v: serde_json::Value = serde_json::from_str(conn.trim()).expect("a single challenge line, nothing after it");
+        assert_eq!(v["challenge"].as_str().map(str::len), Some(64), "{conn}");
+        assert!(!conn.contains("SECRET") && !conn.contains("c3c3") && !conn.contains("example.com"), "{conn}");
+    }
+    std::fs::remove_dir_all(&data_dir).ok();
+}

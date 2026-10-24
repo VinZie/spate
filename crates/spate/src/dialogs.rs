@@ -6,6 +6,8 @@ use std::time::{Duration, Instant};
 
 use eframe::egui::{self, Align, Color32, Id, Layout, RichText, vec2};
 use spate_core::ipc::AddItem;
+use spate_core::manager::is_credential_header;
+use spate_core::naming;
 use spate_core::settings::Schedule;
 use spate_core::{AddRequest, Category, DownloadKind, ItemView, Manager, ProbeInfo, Settings, StartMode};
 
@@ -49,12 +51,29 @@ fn folder_row(ui: &mut egui::Ui, dir: &mut String, edited: &mut bool) {
     });
 }
 
-fn kind_from_item(kind: Option<&str>) -> Option<DownloadKind> {
-    match kind.map(str::to_ascii_lowercase).as_deref() {
+fn kind_from_item(item: &AddItem) -> Option<DownloadKind> {
+    match item.kind.as_deref().map(str::to_ascii_lowercase).as_deref() {
         Some("hls") => Some(DownloadKind::Hls),
         Some("http") => Some(DownloadKind::Http),
-        _ => None,
+        _ => item.mime.as_deref().filter(|m| is_hls_mime(m)).map(|_| DownloadKind::Hls),
     }
+}
+
+fn is_hls_mime(mime: &str) -> bool {
+    let mime = mime.split(';').next().unwrap_or("").trim().to_ascii_lowercase();
+    matches!(mime.as_str(), "application/vnd.apple.mpegurl" | "application/x-mpegurl" | "audio/mpegurl" | "audio/x-mpegurl")
+}
+
+/// The name a browser/CLI item is saved under, as the dialogs show it.
+fn item_name(item: &AddItem) -> String {
+    match item.file_name.as_deref().map(str::trim).filter(|n| !n.is_empty()) {
+        Some(name) => naming::sanitize(name),
+        None => name_from_url(&item.url),
+    }
+}
+
+fn name_from_url(url: &str) -> String {
+    naming::sanitize(&urls::file_name_from_url(url.trim()))
 }
 
 /// Request for a browser/CLI item that is added without asking.
@@ -65,14 +84,128 @@ pub fn request_from_item(item: &AddItem, start: StartMode) -> AddRequest {
         file_name: item.file_name.clone().filter(|n| !n.trim().is_empty()),
         dir: item.dir.clone(),
         start,
-        kind: kind_from_item(item.kind.as_deref()),
+        kind: kind_from_item(item),
         ..Default::default()
     }
+}
+
+/// Whether Enter was pressed this frame. Key repeat does not count: holding
+/// Enter down must not confirm a dialog that appears meanwhile.
+pub fn enter_pressed(events: &[egui::Event]) -> bool {
+    events.iter().any(|e| matches!(e, egui::Event::Key { key: egui::Key::Enter, pressed: true, repeat: false, .. }))
+}
+
+const WAIT_HINT: &str = "Available in a moment";
+
+/// Keeps a dialog that opened by itself (a download from the browser, a
+/// link from the clipboard watcher) from being confirmed by a click or an
+/// Enter meant for something else: its confirm actions only work once it
+/// has been showing in the focused window for [`ConfirmGate::DELAY`].
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ConfirmGate {
+    /// Since when the dialog has been showing with the window focused.
+    since: Option<Instant>,
+}
+
+impl ConfirmGate {
+    pub const DELAY: Duration = Duration::from_millis(1000);
+
+    /// Call on every frame the dialog is shown. Returns whether it may be
+    /// confirmed now; losing the focus starts the wait over.
+    pub fn update(&mut self, now: Instant, focused: bool) -> bool {
+        if !focused {
+            self.since = None;
+            return false;
+        }
+        let since = *self.since.get_or_insert(now);
+        now.duration_since(since) >= Self::DELAY
+    }
+
+    /// Time left until [`ConfirmGate::update`] allows confirming.
+    pub fn remaining(&self, now: Instant) -> Duration {
+        self.since.map_or(Self::DELAY, |s| Self::DELAY.saturating_sub(now.duration_since(s)))
+    }
+}
+
+/// `gate` updated for this frame (no gate: always open), asking for a
+/// repaint for when it opens.
+fn gate_open(gate: &mut Option<ConfirmGate>, ctx: &egui::Context) -> bool {
+    let Some(gate) = gate else { return true };
+    let now = Instant::now();
+    let open = gate.update(now, ctx.input(|i| i.focused));
+    if !open {
+        ctx.request_repaint_after(gate.remaining(now) + Duration::from_millis(20));
+    }
+    open
+}
+
+/// `name` shortened in the middle to fit `width`, so that the extension
+/// stays visible however long the name is.
+pub fn fit_name(ui: &egui::Ui, name: &str, font: &egui::FontId, width: f32) -> String {
+    let fits = |s: &str| ui.painter().layout_no_wrap(s.to_string(), font.clone(), Color32::WHITE).size().x <= width;
+    if fits(name) {
+        return name.to_string();
+    }
+    let (mut lo, mut hi) = (0, name.chars().count());
+    while lo < hi {
+        let mid = (lo + hi).div_ceil(2);
+        if fits(&format::middle_ellipsis(name, mid)) { lo = mid } else { hi = mid - 1 }
+    }
+    format::middle_ellipsis(name, lo)
+}
+
+/// A file name in bold, shortened in the middle when long (full name on
+/// hover).
+fn name_label(ui: &mut egui::Ui, name: &str) -> egui::Response {
+    let font = egui::TextStyle::Body.resolve(ui.style());
+    let shown = fit_name(ui, name, &font, ui.available_width());
+    let r = ui.add(egui::Label::new(RichText::new(shown.as_str()).strong()).wrap_mode(egui::TextWrapMode::Extend));
+    if shown != name { r.on_hover_text(name) } else { r }
 }
 
 // ---------------------------------------------------------------------------
 // Add URL / captured download
 // ---------------------------------------------------------------------------
+
+/// Where the address in an [`AddDialog`] came from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Source {
+    /// Typed by the user; the dialog opens empty.
+    Typed,
+    /// Taken from the clipboard because the user asked to add a download.
+    Clipboard,
+    /// Noticed on the clipboard by the watcher; the dialog opened by itself.
+    ClipboardWatch,
+    /// Handed over by the browser extension, the CLI or the command line.
+    Capture,
+}
+
+impl Source {
+    /// Whether the dialog opened without the user asking for it.
+    fn unprompted(self) -> bool {
+        matches!(self, Source::ClipboardWatch | Source::Capture)
+    }
+}
+
+/// Whether a dialog checks its address with the server before the user has
+/// confirmed. An address the user did not type (the clipboard can be written
+/// by any web page) is only checked when asked to. A captured download is
+/// only checked if it came without credentials: the check never sends them
+/// (see [`check_headers`]), so it would describe a login page rather than
+/// the file. Editing the address always checks it.
+fn checks_on_its_own(source: Source, headers: &[(String, String)]) -> bool {
+    match source {
+        Source::Typed => true,
+        Source::Clipboard | Source::ClipboardWatch => false,
+        Source::Capture => !headers.iter().any(|(name, _)| is_credential_header(name)),
+    }
+}
+
+/// Headers for checking an address before the download is confirmed:
+/// never cookies or other credentials.
+fn check_headers(headers: &[(String, String)]) -> Vec<(String, String)> {
+    headers.iter().filter(|(name, _)| !is_credential_header(name)).cloned().collect()
+}
 
 enum Probe {
     Idle,
@@ -83,8 +216,7 @@ enum Probe {
 
 pub struct AddDialog {
     id: Id,
-    /// Opened for a download captured from the browser.
-    pub capture: bool,
+    source: Source,
     url: String,
     headers: Vec<(String, String)>,
     file_name: String,
@@ -95,11 +227,12 @@ pub struct AddDialog {
     limit_kib: u64,
     sha256: String,
     browser_size: Option<u64>,
+    browser_mime: Option<String>,
     kind: Option<DownloadKind>,
     probe: Probe,
-    probed_url: String,
     url_changed: Option<Instant>,
     focus_url: bool,
+    gate: Option<ConfirmGate>,
     error: Option<String>,
 }
 
@@ -110,13 +243,18 @@ pub enum DialogResult<T> {
 }
 
 impl AddDialog {
-    pub fn new(url: String, settings: &Settings) -> Self {
-        let name = if url.is_empty() { String::new() } else { urls::file_name_from_url(&url) };
+    /// A dialog for `url` (empty for [`Source::Typed`]).
+    pub fn new(url: String, source: Source, settings: &Settings) -> Self {
+        Self::unchecked(url, source, settings).check_if_allowed()
+    }
+
+    fn unchecked(url: String, source: Source, settings: &Settings) -> Self {
+        let name = if url.is_empty() { String::new() } else { name_from_url(&url) };
         let dir = settings.dir_for(Category::for_file_name(&name)).display().to_string();
         let has_url = urls::is_http_url(&url);
         Self {
             id: Id::unique(("add_dialog", Instant::now())),
-            capture: false,
+            source,
             url,
             headers: Vec::new(),
             file_name: name,
@@ -127,22 +265,21 @@ impl AddDialog {
             limit_kib: 0,
             sha256: String::new(),
             browser_size: None,
+            browser_mime: None,
             kind: None,
             probe: Probe::Idle,
-            probed_url: String::new(),
-            // Probe a prefilled URL right away.
-            url_changed: has_url.then(|| Instant::now().checked_sub(Duration::from_secs(1)).unwrap_or_else(Instant::now)),
+            url_changed: None,
             focus_url: !has_url,
+            gate: source.unprompted().then(ConfirmGate::default),
             error: None,
         }
     }
 
     pub fn from_capture(item: &AddItem, settings: &Settings) -> Self {
-        let mut d = Self::new(item.url.trim().to_string(), settings);
-        d.capture = true;
+        let mut d = Self::unchecked(item.url.trim().to_string(), Source::Capture, settings);
         d.headers = item.request_headers();
         if let Some(name) = item.file_name.as_deref().filter(|n| !n.trim().is_empty()) {
-            d.file_name = name.trim().to_string();
+            d.file_name = naming::sanitize(name.trim());
             d.name_edited = true;
             d.dir = settings.dir_for(Category::for_file_name(&d.file_name)).display().to_string();
         }
@@ -151,18 +288,30 @@ impl AddDialog {
             d.dir_edited = true;
         }
         d.browser_size = item.size;
-        d.kind = kind_from_item(item.kind.as_deref());
+        d.browser_mime = item.mime.clone().filter(|m| !m.trim().is_empty());
+        d.kind = kind_from_item(item);
         d.focus_url = false;
-        d
+        d.check_if_allowed()
+    }
+
+    /// Check a prefilled address right away if that is allowed.
+    fn check_if_allowed(mut self) -> Self {
+        if urls::is_http_url(&self.url) && checks_on_its_own(self.source, &self.headers) {
+            self.check_now();
+        }
+        self
+    }
+
+    fn check_now(&mut self) {
+        self.url_changed = Some(Instant::now().checked_sub(Duration::from_secs(1)).unwrap_or_else(Instant::now));
     }
 
     fn poll_probe(&mut self, manager: &Manager, settings: &Settings, ctx: &egui::Context) {
         let url = self.url.trim().to_string();
         if let Some(t) = self.url_changed {
-            if t.elapsed() >= Duration::from_millis(450) && urls::is_http_url(&url) && url != self.probed_url {
+            if t.elapsed() >= Duration::from_millis(450) && urls::is_http_url(&url) {
                 self.url_changed = None;
-                self.probed_url = url.clone();
-                self.probe = Probe::Pending(manager.probe(url, self.headers.clone()));
+                self.probe = Probe::Pending(manager.probe(url, check_headers(&self.headers)));
             } else if t.elapsed() < Duration::from_millis(450) {
                 ctx.request_repaint_after(Duration::from_millis(120));
             }
@@ -190,11 +339,15 @@ impl AddDialog {
 
     fn request(&self, start: StartMode) -> AddRequest {
         let probe_named = matches!(self.probe, Probe::Done(_));
+        let capture = self.source == Source::Capture;
         AddRequest {
             url: self.url.trim().to_string(),
             headers: self.headers.clone(),
-            file_name: (self.name_edited || probe_named).then(|| self.file_name.trim().to_string()).filter(|n| !n.is_empty()),
-            dir: (self.dir_edited || probe_named || self.capture).then(|| PathBuf::from(self.dir.trim())).filter(|d| !d.as_os_str().is_empty()),
+            // Always the name shown, even if it is the one in the address:
+            // otherwise the server's suggestion would replace what the user
+            // confirmed (`invoice.pdf` saved as `invoice.exe`).
+            file_name: Some(self.file_name.trim().to_string()).filter(|n| !n.is_empty()),
+            dir: (self.dir_edited || probe_named || capture).then(|| PathBuf::from(self.dir.trim())).filter(|d| !d.as_os_str().is_empty()),
             start,
             connections: Some(self.connections),
             speed_limit: (self.limit_kib > 0).then_some(self.limit_kib * 1024),
@@ -222,10 +375,11 @@ impl AddDialog {
 
     pub fn show(&mut self, ctx: &egui::Context, manager: &Manager, settings: &Settings, items: &[ItemView], position: Option<(usize, usize)>) -> DialogResult<AddRequest> {
         self.poll_probe(manager, settings, ctx);
+        let armed = gate_open(&mut self.gate, ctx);
         let mut result = DialogResult::Open;
         let modal = egui::Modal::new(self.id).frame(dialog_frame(ctx)).show(ctx, |ui| {
             ui.set_width(560.0);
-            let heading = if self.capture { "Confirm download" } else { "Add download" };
+            let heading = if self.source == Source::Capture { "Confirm download" } else { "Add download" };
             ui.horizontal(|ui| {
                 title(ui, heading);
                 if let Some((i, n)) = position.filter(|(_, n)| *n > 1) {
@@ -247,7 +401,7 @@ impl AddDialog {
                 if r.changed() {
                     self.url_changed = Some(Instant::now());
                     if !self.name_edited {
-                        self.file_name = urls::file_name_from_url(self.url.trim());
+                        self.file_name = name_from_url(&self.url);
                         if !self.dir_edited {
                             self.dir = settings.dir_for(Category::for_file_name(&self.file_name)).display().to_string();
                         }
@@ -301,19 +455,24 @@ impl AddDialog {
             }
             ui.add_space(10.0);
             ui.horizontal(|ui| {
-                let (now_label, later_label) = if self.capture { ("Start", "Later") } else { ("Start now", "Add to queue") };
+                let (now_label, later_label) =
+                    if self.source == Source::Capture { ("Start", "Later") } else { ("Start now", "Add to queue") };
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     if ui.add(secondary_button("Cancel")).clicked() {
                         result = DialogResult::Cancel;
                     }
-                    if ui.add(secondary_button(later_label)).on_hover_text("Add to the queue; it starts when the queue runs").clicked() {
+                    let later = ui
+                        .add_enabled(armed, secondary_button(later_label))
+                        .on_hover_text("Add to the queue; it starts when the queue runs")
+                        .on_disabled_hover_text(WAIT_HINT);
+                    if later.clicked() {
                         match self.validate() {
                             Ok(()) => result = DialogResult::Done(self.request(StartMode::Queue)),
                             Err(e) => self.error = Some(e),
                         }
                     }
-                    let enter = ui.input(|i| i.key_pressed(egui::Key::Enter));
-                    if ui.add(primary_button(now_label)).clicked() || enter {
+                    let enter = armed && ui.input(|i| enter_pressed(&i.events));
+                    if ui.add_enabled(armed, primary_button(now_label)).on_disabled_hover_text(WAIT_HINT).clicked() || enter {
                         match self.validate() {
                             Ok(()) => result = DialogResult::Done(self.request(StartMode::Now)),
                             Err(e) => self.error = Some(e),
@@ -328,17 +487,31 @@ impl AddDialog {
         result
     }
 
-    fn info_card(&self, ui: &mut egui::Ui, items: &[ItemView]) {
+    fn info_card(&mut self, ui: &mut egui::Ui, items: &[ItemView]) {
         egui::Frame::group(ui.style()).fill(ui.visuals().faint_bg_color).corner_radius(8).inner_margin(10).show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.horizontal(|ui| {
-                let cat = Category::for_file_name(&self.file_name);
+                // The name exactly as it will be saved, extension in view.
+                let name = if self.file_name.trim().is_empty() { String::new() } else { naming::sanitize(self.file_name.trim()) };
+                let cat = Category::for_file_name(&name);
                 icons::category_glyph(ui, cat, 30.0);
                 ui.vertical(|ui| {
-                    let name = if self.file_name.trim().is_empty() { "–" } else { self.file_name.trim() };
-                    ui.label(RichText::new(name).strong());
+                    if name.is_empty() {
+                        ui.label(RichText::new("–").strong());
+                    } else {
+                        name_label(ui, &name);
+                    }
+                    let unchecked = matches!(self.probe, Probe::Idle) && self.url_changed.is_none();
                     let line = match &self.probe {
                         Probe::Idle if !urls::is_http_url(self.url.trim()) => RichText::new("Paste or type a download address.").weak(),
+                        Probe::Idle if unchecked => {
+                            // Not checked with the server: what is known so far.
+                            let mut parts: Vec<String> = self.browser_size.map(format::size).into_iter().collect();
+                            parts.push(cat.label().to_string());
+                            parts.extend(self.browser_mime.clone());
+                            parts.push(if self.source == Source::Capture { "not checked" } else { "not checked yet" }.into());
+                            RichText::new(parts.join(" · ")).weak()
+                        }
                         Probe::Idle | Probe::Pending(_) => {
                             let mut t = "Checking the address…".to_string();
                             if let Some(s) = self.browser_size {
@@ -360,7 +533,16 @@ impl AddDialog {
                         }
                         Probe::Failed(e) => RichText::new(format!("Could not check the address: {e}")).color(theme::WARN),
                     };
-                    ui.label(line);
+                    if unchecked && self.source != Source::Capture && urls::is_http_url(self.url.trim()) {
+                        ui.horizontal(|ui| {
+                            ui.label(line);
+                            if ui.small_button("Check").on_hover_text("Ask the server for the name and size").clicked() {
+                                self.check_now();
+                            }
+                        });
+                    } else {
+                        ui.label(line);
+                    }
                     if let Probe::Done(info) = &self.probe
                         && info.final_url != self.url.trim()
                         && !info.final_url.is_empty()
@@ -410,6 +592,7 @@ pub struct BatchDialog {
     dir: String,
     dir_edited: bool,
     connections: usize,
+    gate: Option<ConfirmGate>,
 }
 
 pub struct BatchOutcome {
@@ -417,10 +600,13 @@ pub struct BatchOutcome {
 }
 
 impl BatchDialog {
+    /// `editable` lists are the user's own; the others came from the browser
+    /// and so opened by themselves.
     pub fn new(items: Vec<AddItem>, editable: bool, settings: &Settings) -> Self {
         Self {
             id: Id::unique(("batch_dialog", Instant::now())),
             entries: items.into_iter().map(|item| BatchEntry { checked: true, item }).collect(),
+            gate: (!editable).then(ConfirmGate::default),
             editable,
             source: BatchSource::List,
             paste: String::new(),
@@ -456,6 +642,7 @@ impl BatchDialog {
     }
 
     pub fn show(&mut self, ctx: &egui::Context) -> DialogResult<BatchOutcome> {
+        let armed = gate_open(&mut self.gate, ctx);
         let mut result = DialogResult::Open;
         let modal = egui::Modal::new(self.id).frame(dialog_frame(ctx)).show(ctx, |ui| {
             ui.set_width(640.0);
@@ -542,9 +729,12 @@ impl BatchDialog {
                     for (i, e) in self.entries.iter_mut().enumerate() {
                         ui.horizontal(|ui| {
                             ui.checkbox(&mut e.checked, "");
-                            let name = e.item.file_name.clone().filter(|n| !n.is_empty()).unwrap_or_else(|| urls::file_name_from_url(&e.item.url));
+                            let name = item_name(&e.item);
                             icons::category_glyph(ui, Category::for_file_name(&name), 16.0);
-                            ui.add(egui::Label::new(RichText::new(&name).strong()).truncate()).on_hover_text(&e.item.url);
+                            let font = egui::TextStyle::Body.resolve(ui.style());
+                            let shown = fit_name(ui, &name, &font, ui.available_width() * 0.55);
+                            ui.add(egui::Label::new(RichText::new(shown).strong()).wrap_mode(egui::TextWrapMode::Extend))
+                                .on_hover_text(format!("{name}\n{}", e.item.url));
                             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                                 if self.editable && ui.small_button("×").on_hover_text("Remove from this list").clicked() {
                                     remove = Some(i);
@@ -581,10 +771,11 @@ impl BatchDialog {
                     result = DialogResult::Cancel;
                 }
                 let any = checked > 0;
-                if ui.add_enabled(any, secondary_button("Add to queue")).clicked() {
+                let hint = |r: egui::Response| if armed { r } else { r.on_disabled_hover_text(WAIT_HINT) };
+                if hint(ui.add_enabled(any && armed, secondary_button("Add to queue"))).clicked() {
                     result = DialogResult::Done(self.outcome(StartMode::Queue));
                 }
-                if ui.add_enabled(any, primary_button("Start all")).clicked() {
+                if hint(ui.add_enabled(any && armed, primary_button("Start all"))).clicked() {
                     result = DialogResult::Done(self.outcome(StartMode::Now));
                 }
             });
@@ -603,6 +794,8 @@ impl BatchDialog {
             .filter(|e| e.checked)
             .map(|e| {
                 let mut r = request_from_item(&e.item, start);
+                // The name the list showed is the name saved.
+                r.file_name = Some(item_name(&e.item));
                 if dir.is_some() {
                     r.dir = dir.clone();
                 }
@@ -651,7 +844,10 @@ impl DeleteDialog {
             let n = self.ids.len();
             title(ui, if self.completed_only { "Remove completed downloads" } else { "Delete downloads" });
             if n == 1 {
-                ui.label(format!("Remove “{}” from the list?", self.names.first().map(String::as_str).unwrap_or("")));
+                let name = self.names.first().map(String::as_str).unwrap_or("");
+                let font = egui::TextStyle::Body.resolve(ui.style());
+                let shown = fit_name(ui, name, &font, ui.available_width() - 160.0);
+                ui.label(format!("Remove “{shown}” from the list?")).on_hover_text(name);
             } else {
                 ui.label(format!("Remove {n} downloads from the list?"));
             }
@@ -670,7 +866,7 @@ impl DeleteDialog {
                 }
                 let label = if self.delete_files { "Delete files" } else { "Remove" };
                 let btn = egui::Button::new(RichText::new(label).color(Color32::WHITE).strong()).fill(theme::BAD).min_size(vec2(96.0, 30.0));
-                if ui.add(btn).clicked() || ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                if ui.add(btn).clicked() || ui.input(|i| enter_pressed(&i.events)) {
                     result = DialogResult::Done(self.delete_files);
                 }
             });
@@ -1084,4 +1280,132 @@ pub fn shortcuts_dialog(ctx: &egui::Context) -> bool {
         });
     });
     close || modal.should_close()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn enter(pressed: bool, repeat: bool) -> egui::Event {
+        egui::Event::Key { key: egui::Key::Enter, physical_key: None, pressed, repeat, modifiers: egui::Modifiers::NONE }
+    }
+
+    fn header(name: &str, value: &str) -> (String, String) {
+        (name.into(), value.into())
+    }
+
+    fn capture(url: &str, name: Option<&str>, cookies: Option<&str>) -> AddItem {
+        AddItem {
+            url: url.into(),
+            file_name: name.map(String::from),
+            cookies: cookies.map(String::from),
+            referrer: Some("https://site.example/".into()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn confirm_gate_waits_for_a_focused_second() {
+        let t0 = Instant::now();
+        let ms = |n: u64| t0 + Duration::from_millis(n);
+        let mut gate = ConfirmGate::default();
+        assert_eq!(gate.remaining(t0), ConfirmGate::DELAY);
+        assert!(!gate.update(t0, true));
+        assert!(!gate.update(ms(999), true));
+        assert_eq!(gate.remaining(ms(900)), Duration::from_millis(100));
+        assert!(gate.update(ms(1000), true));
+        // Switching away and back starts the wait over.
+        assert!(!gate.update(ms(1100), false));
+        assert!(!gate.update(ms(1200), true));
+        assert!(!gate.update(ms(2150), true));
+        assert!(gate.update(ms(2200), true));
+        // A dialog waiting in a window without focus never opens.
+        let mut gate = ConfirmGate::default();
+        assert!((0..50).all(|i| !gate.update(ms(i * 100), false)));
+    }
+
+    #[test]
+    fn held_enter_does_not_confirm() {
+        assert!(enter_pressed(&[enter(true, false)]));
+        assert!(!enter_pressed(&[enter(true, true), enter(true, true)]));
+        assert!(!enter_pressed(&[enter(false, false)]));
+        assert!(!enter_pressed(&[egui::Event::Text("\n".into())]));
+        assert!(enter_pressed(&[enter(true, true), enter(false, false), enter(true, false)]));
+    }
+
+    #[test]
+    fn dialogs_that_open_by_themselves_are_gated() {
+        let s = Settings::default();
+        let url = "https://site.example/files/a.zip".to_string();
+        assert!(AddDialog::from_capture(&capture(&url, None, None), &s).gate.is_some());
+        assert!(AddDialog::new(url.clone(), Source::ClipboardWatch, &s).gate.is_some());
+        assert!(AddDialog::new(url.clone(), Source::Clipboard, &s).gate.is_none());
+        assert!(AddDialog::new(String::new(), Source::Typed, &s).gate.is_none());
+        assert!(BatchDialog::new(vec![capture(&url, None, None)], false, &s).gate.is_some());
+        assert!(BatchDialog::from_urls(vec![url], &s).gate.is_none());
+    }
+
+    #[test]
+    fn checks_before_confirming_never_carry_credentials() {
+        let creds = [header("Cookie", "s=1"), header("Referer", "https://site.example/")];
+        let plain = [header("Referer", "https://site.example/"), header("User-Agent", "UA")];
+        assert!(checks_on_its_own(Source::Typed, &[]));
+        assert!(!checks_on_its_own(Source::Clipboard, &[]));
+        assert!(!checks_on_its_own(Source::ClipboardWatch, &[]));
+        assert!(!checks_on_its_own(Source::Capture, &creds));
+        assert!(!checks_on_its_own(Source::Capture, &[header("authorization", "Bearer x")]));
+        assert!(checks_on_its_own(Source::Capture, &plain));
+        let all = [header("Cookie", "s=1"), header("Authorization", "Basic x"), header("Referer", "r"), header("User-Agent", "UA")];
+        assert_eq!(check_headers(&all), vec![header("Referer", "r"), header("User-Agent", "UA")]);
+
+        let s = Settings::default();
+        let url = "https://site.example/files/a.zip";
+        let scheduled = |d: &AddDialog| d.url_changed.is_some();
+        assert!(!scheduled(&AddDialog::from_capture(&capture(url, Some("a.zip"), Some("s=1")), &s)));
+        assert!(scheduled(&AddDialog::from_capture(&capture(url, Some("a.zip"), None), &s)));
+        assert!(!scheduled(&AddDialog::new(url.into(), Source::Clipboard, &s)));
+        assert!(!scheduled(&AddDialog::new(url.into(), Source::ClipboardWatch, &s)));
+        // Asking for it (the Check button) is what starts a check.
+        let mut d = AddDialog::new(url.into(), Source::Clipboard, &s);
+        d.check_now();
+        assert!(scheduled(&d));
+    }
+
+    #[test]
+    fn the_name_shown_is_the_name_requested() {
+        let s = Settings::default();
+        // Equal to the name in the address: still requested, so the server
+        // cannot swap it.
+        let d = AddDialog::from_capture(&capture("https://site.example/invoice.pdf", Some("invoice.pdf"), Some("s=1")), &s);
+        let req = d.request(StartMode::Now);
+        assert_eq!(req.file_name.as_deref(), Some("invoice.pdf"));
+        assert!(req.headers.contains(&header("Cookie", "s=1")), "the download itself keeps the cookies");
+        let d = AddDialog::new("https://site.example/files/setup.msi".into(), Source::Clipboard, &s);
+        assert_eq!(d.request(StartMode::Queue).file_name.as_deref(), Some("setup.msi"));
+        // A name that would read differently is shown the way it is saved.
+        let d = AddDialog::from_capture(&capture("https://site.example/x", Some("invoice\u{202E}fdp.exe"), None), &s);
+        assert_eq!(d.file_name, "invoicefdp.exe");
+
+        let items = vec![
+            capture("https://site.example/files/a.zip", None, None),
+            capture("https://site.example/get?id=1", Some("report  .pdf"), None),
+        ];
+        let out = BatchDialog::new(items, false, &s).outcome(StartMode::Now);
+        let names: Vec<_> = out.requests.iter().map(|r| r.file_name.clone().unwrap_or_default()).collect();
+        assert_eq!(names, ["a.zip", "report .pdf"]);
+    }
+
+    #[test]
+    fn hls_is_recognised_from_the_browser_type() {
+        let item = |kind: Option<&str>, mime: Option<&str>| AddItem {
+            url: "https://cdn.example/stream".into(),
+            kind: kind.map(String::from),
+            mime: mime.map(String::from),
+            ..Default::default()
+        };
+        assert_eq!(kind_from_item(&item(Some("HLS"), None)), Some(DownloadKind::Hls));
+        assert_eq!(kind_from_item(&item(None, Some("application/vnd.apple.mpegurl; charset=utf-8"))), Some(DownloadKind::Hls));
+        assert_eq!(kind_from_item(&item(Some("http"), Some("application/x-mpegURL"))), Some(DownloadKind::Http));
+        assert_eq!(kind_from_item(&item(None, Some("video/mp4"))), None);
+    }
 }

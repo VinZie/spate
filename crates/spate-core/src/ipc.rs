@@ -7,6 +7,20 @@
 //! token, so unlike an unauthenticated localhost socket they cannot drive the
 //! app.
 //!
+//! The port in a stale `ipc.json` (left by a crash) may since have been taken
+//! by another program, possibly another user's. So before the token and the
+//! request (which can carry cookies) go out, the client sends a fresh random
+//! challenge and the server must answer with
+//! `HMAC-SHA256(token, challenge || PROOF_CONTEXT)`, which only a process that
+//! read our `ipc.json` can compute:
+//!
+//! ```text
+//! client -> {"challenge": "<64 hex digits>"}
+//! server <- {"proof": "<64 hex digits>", "version": "..."}
+//! client -> {"token": "...", "op": "add", ...}
+//! server <- {"ok": true, ...}
+//! ```
+//!
 //! Browser extension → native host messages use Chrome's native-messaging
 //! framing (u32 little-endian length + UTF-8 JSON); see [`NativeRequest`].
 
@@ -117,23 +131,92 @@ struct Envelope {
     request: Request,
 }
 
+/// First line of a connection: the client asks the server to prove it
+/// knows the token.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Challenge {
+    challenge: String,
+}
+
+#[derive(Serialize, Deserialize)]
+struct Proof {
+    proof: String,
+    #[serde(default)]
+    version: String,
+}
+
+/// Domain separation for the server's proof, so it cannot be mistaken for
+/// any other use of the token.
+const PROOF_CONTEXT: &[u8] = b"spate-ipc v1 server proof";
+const CHALLENGE_BYTES: usize = 32;
+
+/// `HMAC-SHA256(token, challenge || PROOF_CONTEXT)`, hex-encoded.
+fn proof_for(token: &str, challenge: &[u8]) -> String {
+    hex::encode(hmac_sha256(token.as_bytes(), &[challenge, PROOF_CONTEXT]))
+}
+
+/// HMAC-SHA256 (RFC 2104) of the concatenation of `parts`.
+fn hmac_sha256(key: &[u8], parts: &[&[u8]]) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    const BLOCK: usize = 64;
+    let mut k = [0u8; BLOCK];
+    if key.len() > BLOCK {
+        k[..32].copy_from_slice(&Sha256::digest(key));
+    } else {
+        k[..key.len()].copy_from_slice(key);
+    }
+    let mut inner = Sha256::new();
+    inner.update(k.map(|b| b ^ 0x36));
+    for part in parts {
+        inner.update(part);
+    }
+    let mut outer = Sha256::new();
+    outer.update(k.map(|b| b ^ 0x5c));
+    outer.update(inner.finalize());
+    let mut mac = [0u8; 32];
+    mac.copy_from_slice(&outer.finalize());
+    mac
+}
+
 pub fn read_info(data_dir: &Path) -> Option<IpcInfo> {
     let bytes = std::fs::read(info_path(data_dir)).ok()?;
     serde_json::from_slice(&bytes).ok()
 }
 
-/// Send one request to the running app.
+/// Send one request to the running app. Nothing but a random challenge is
+/// sent until the other end has proven that it knows the token.
 pub fn send(data_dir: &Path, request: &Request) -> io::Result<Response> {
     let info = read_info(data_dir).ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "Spate is not running"))?;
     let addr = SocketAddr::from(([127, 0, 0, 1], info.port));
     let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(2))?;
     stream.set_read_timeout(Some(Duration::from_secs(10)))?;
-    let mut line = serde_json::to_vec(&Envelope { token: info.token, request: request.clone() })?;
+    let mut reader = BufReader::new(stream.try_clone()?);
+
+    let mut challenge = [0u8; CHALLENGE_BYTES];
+    getrandom::fill(&mut challenge).map_err(|e| io::Error::other(e.to_string()))?;
+    write_line(&mut stream, &Challenge { challenge: hex::encode(challenge) })?;
+    let mut line = String::new();
+    reader.read_line(&mut line)?;
+    let proven = serde_json::from_str::<Proof>(&line)
+        .is_ok_and(|p| constant_time_eq(p.proof.as_bytes(), proof_for(&info.token, &challenge).as_bytes()));
+    if !proven {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("the program on port {} could not prove it is Spate; {} may be stale", info.port, info_path(data_dir).display()),
+        ));
+    }
+
+    write_line(&mut stream, &Envelope { token: info.token, request: request.clone() })?;
+    line.clear();
+    reader.read_line(&mut line)?;
+    serde_json::from_str(&line).map_err(io::Error::other)
+}
+
+fn write_line(w: &mut impl Write, value: &impl Serialize) -> io::Result<()> {
+    let mut line = serde_json::to_vec(value)?;
     line.push(b'\n');
-    stream.write_all(&line)?;
-    let mut reply = String::new();
-    BufReader::new(stream).read_line(&mut reply)?;
-    serde_json::from_str(&reply).map_err(io::Error::other)
+    w.write_all(&line)
 }
 
 /// Whether an app instance answers on the advertised endpoint.
@@ -185,13 +268,21 @@ pub async fn serve(data_dir: &Path, handler: Handler) -> io::Result<IpcServer> {
 }
 
 async fn handle_conn(stream: tokio::net::TcpStream, token: &str, handler: Handler) -> io::Result<()> {
-    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
+    use tokio::io::AsyncReadExt;
     let (read, mut write) = stream.into_split();
     let mut line = String::new();
     let mut reader = tokio::io::BufReader::new(read.take(1 << 20));
-    tokio::time::timeout(Duration::from_secs(10), reader.read_line(&mut line))
-        .await
-        .map_err(|_| io::Error::from(io::ErrorKind::TimedOut))??;
+    read_line(&mut reader, &mut line).await?;
+    // Current clients first ask us to prove who we are; the request follows.
+    // A request without a challenge is still served, as before.
+    if let Ok(c) = serde_json::from_str::<Challenge>(&line) {
+        let bytes = hex::decode(c.challenge.trim()).ok().filter(|b| b.len() == CHALLENGE_BYTES);
+        let Some(challenge) = bytes else {
+            return write_json(&mut write, &Response::err("bad challenge")).await;
+        };
+        write_json(&mut write, &Proof { proof: proof_for(token, &challenge), version: VERSION.into() }).await?;
+        read_line(&mut reader, &mut line).await?;
+    }
     let response = match serde_json::from_str::<Envelope>(&line) {
         Ok(env) if constant_time_eq(env.token.as_bytes(), token.as_bytes()) => {
             tokio::task::spawn_blocking(move || handler(env.request)).await.unwrap_or_else(|e| Response::err(e.to_string()))
@@ -199,9 +290,23 @@ async fn handle_conn(stream: tokio::net::TcpStream, token: &str, handler: Handle
         Ok(_) => Response::err("invalid token"),
         Err(e) => Response::err(format!("bad request: {e}")),
     };
-    let mut out = serde_json::to_vec(&response)?;
+    write_json(&mut write, &response).await
+}
+
+async fn read_line(r: &mut (impl tokio::io::AsyncBufRead + Unpin), line: &mut String) -> io::Result<()> {
+    use tokio::io::AsyncBufReadExt;
+    line.clear();
+    tokio::time::timeout(Duration::from_secs(10), r.read_line(line))
+        .await
+        .map_err(|_| io::Error::from(io::ErrorKind::TimedOut))??;
+    Ok(())
+}
+
+async fn write_json(w: &mut (impl tokio::io::AsyncWrite + Unpin), value: &impl Serialize) -> io::Result<()> {
+    use tokio::io::AsyncWriteExt;
+    let mut out = serde_json::to_vec(value)?;
     out.push(b'\n');
-    write.write_all(&out).await
+    w.write_all(&out).await
 }
 
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
@@ -315,8 +420,41 @@ mod tests {
         assert!(add.request_headers().contains(&("Cookie".into(), "a=b".into())));
     }
 
-    #[tokio::test]
-    async fn server_requires_token() {
+    #[test]
+    fn hmac_matches_rfc_4231() {
+        let hex = |b: [u8; 32]| hex::encode(b);
+        assert_eq!(
+            hex(hmac_sha256(&[0x0b; 20], &[b"Hi There"])),
+            "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7"
+        );
+        assert_eq!(
+            hex(hmac_sha256(b"Jefe", &[b"what do ya want ", b"for nothing?"])),
+            "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"
+        );
+        assert_eq!(
+            hex(hmac_sha256(&[0xaa; 131], &[b"Test Using Larger Than Block-Size Key - Hash Key First"])),
+            "60e431591ee0b67f0d8a26aacbf5b77f8e0bc6213728c5140546040f0ee37f54"
+        );
+    }
+
+    /// One raw line-protocol exchange with the server at `info`.
+    fn exchange(info: &IpcInfo, lines: &[String]) -> Vec<String> {
+        let mut stream = TcpStream::connect(("127.0.0.1", info.port)).unwrap();
+        stream.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        let mut reader = BufReader::new(stream.try_clone().unwrap());
+        lines
+            .iter()
+            .map(|l| {
+                stream.write_all(format!("{l}\n").as_bytes()).unwrap();
+                let mut reply = String::new();
+                reader.read_line(&mut reply).unwrap();
+                reply
+            })
+            .collect()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn server_proves_itself_and_requires_token() {
         let dir = std::env::temp_dir().join(format!("spate-ipc-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let handler: Handler = Arc::new(|req| match req {
@@ -329,6 +467,34 @@ mod tests {
         assert!(ok.ok);
 
         let info = read_info(&dir).unwrap();
+        let i = info.clone();
+        let replies = tokio::task::spawn_blocking(move || {
+            let ping = |token: &str| serde_json::to_string(&Envelope { token: token.into(), request: Request::Ping }).unwrap();
+            let challenge = [7u8; CHALLENGE_BYTES];
+            let hello = serde_json::to_string(&Challenge { challenge: hex::encode(challenge) }).unwrap();
+            let proof = exchange(&i, std::slice::from_ref(&hello)).remove(0);
+            let proof: Proof = serde_json::from_str(&proof).unwrap();
+            assert_eq!(proof.proof, proof_for(&i.token, &challenge));
+            assert_eq!(proof.version, VERSION);
+            vec![
+                exchange(&i, &[hello.clone(), ping(&"0".repeat(48))]).remove(1),
+                exchange(&i, &[hello, ping(&i.token)]).remove(1),
+                // Clients that do not ask for a proof are still checked.
+                exchange(&i, &[ping("wrong")]).remove(0),
+                exchange(&i, &[ping(&i.token)]).remove(0),
+                exchange(&i, &[r#"{"challenge":"abcd"}"#.into()]).remove(0),
+            ]
+        })
+        .await
+        .unwrap();
+        let r: Vec<Response> = replies.iter().map(|r| serde_json::from_str(r).unwrap()).collect();
+        assert_eq!(r[0].error.as_deref(), Some("invalid token"));
+        assert!(r[1].ok);
+        assert_eq!(r[2].error.as_deref(), Some("invalid token"));
+        assert!(r[3].ok);
+        assert_eq!(r[4].error.as_deref(), Some("bad challenge"));
+
+        // A client holding a wrong token cannot verify the proof and gives up.
         let d = dir.clone();
         let forged = tokio::task::spawn_blocking(move || {
             let mut forged = info.clone();
@@ -339,11 +505,67 @@ mod tests {
             r
         })
         .await
-        .unwrap()
         .unwrap();
-        assert!(!forged.ok);
+        assert_eq!(forged.unwrap_err().kind(), io::ErrorKind::PermissionDenied);
         drop(server);
         assert!(!info_path(&dir).exists());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A program that took over the port of a stale `ipc.json` and answers
+    /// the challenge with `reply`. Returns everything the client sent it.
+    fn impostor(dir: &Path, reply: impl Fn(&str) -> String + Send + 'static) -> std::thread::JoinHandle<Vec<u8>> {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let info = IpcInfo { port: listener.local_addr().unwrap().port(), token: "a1".repeat(24), pid: 1 };
+        std::fs::write(info_path(dir), serde_json::to_vec(&info).unwrap()).unwrap();
+        std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut first = String::new();
+            reader.read_line(&mut first).unwrap();
+            (&stream).write_all(reply(&first).as_bytes()).unwrap();
+            // Keep listening: whatever else arrives would have leaked.
+            let mut rest = Vec::new();
+            let _ = reader.read_to_end(&mut rest);
+            [first.into_bytes(), rest].concat()
+        })
+    }
+
+    #[test]
+    fn client_sends_nothing_sensitive_to_an_impostor() {
+        let dir = std::env::temp_dir().join(format!("spate-ipc-impostor-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let add = Request::Add {
+            items: vec![AddItem { url: "https://example.com/f".into(), cookies: Some("session=SECRET".into()), ..Default::default() }],
+            interactive: false,
+            start: None,
+        };
+        let replies: [fn(&str) -> String; 4] = [
+            // An old-style server, or anything that does not know the protocol.
+            |_| "{\"ok\":true,\"error\":null,\"version\":\"0.1.0\"}\n".into(),
+            |_| "{\"proof\":\"00\"}\n".into(),
+            // Echoing the challenge back, or proving with another token.
+            |c| {
+                let c: Challenge = serde_json::from_str(c).unwrap();
+                format!("{{\"proof\":\"{}\"}}\n", c.challenge)
+            },
+            |c| {
+                let c: Challenge = serde_json::from_str(c).unwrap();
+                let proof = proof_for(&"b2".repeat(24), &hex::decode(c.challenge).unwrap());
+                format!("{{\"proof\":\"{proof}\"}}\n")
+            },
+        ];
+        for reply in replies {
+            let fake = impostor(&dir, reply);
+            let token = read_info(&dir).unwrap().token;
+            let err = send(&dir, &add).unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::PermissionDenied, "{err}");
+            let seen = String::from_utf8(fake.join().unwrap()).unwrap();
+            let challenge: Challenge = serde_json::from_str(seen.trim()).expect("only the challenge was sent");
+            assert_eq!(challenge.challenge.len(), 2 * CHALLENGE_BYTES);
+            assert!(!seen.contains(&token) && !seen.contains("SECRET") && !seen.contains("example.com"), "{seen}");
+        }
         std::fs::remove_dir_all(&dir).ok();
     }
 }
