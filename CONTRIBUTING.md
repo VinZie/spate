@@ -53,6 +53,7 @@ docs/assets/        images used by the README
 
 - **Keep the engine tested.** Changes to `spate-core` should come with a test in `crates/spate-core/tests/` (see `tests/common/mod.rs` for the local test server, which can throttle, cap connections and return errors on demand).
 - **No network in tests.** Tests must pass offline and in CI.
+- **Timing tests.** A few engine tests compare download speeds. On a busy or slow machine run them one at a time with `cargo test -p spate-core --test engine -- --test-threads=1`, as CI does. When a new test depends on how fast connections start, throttle the test server so the outcome doesn't depend on the machine.
 - **Match the surrounding code.** Follow the style, naming and comment density of the file you are editing; run `cargo clippy` and fix new warnings.
 - **Mind the security model.** Don't add listeners that web pages can reach, CORS headers, or options that disable the IPC token or origin checks. See the security section of the README.
 - **Small pull requests** with a clear description of what changed and why are much easier to review.

@@ -149,9 +149,12 @@ async fn server_without_ranges_uses_one_connection() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn ranges_without_accept_ranges_header_still_go_parallel() {
     // The probe asks for `bytes=0-`; a 206 proves range support even when the
-    // server never advertises it.
+    // server never advertises it. The throttle keeps each connection slow
+    // enough that splitting stays worthwhile however fast the machine is
+    // (an unthrottled loopback stream raises the split floor past 4 MiB).
     let size = 4 * MIB;
-    let server = TestServer::start(ServerConfig { accept_ranges: false, ..ServerConfig::sized(size) });
+    let server =
+        TestServer::start(ServerConfig { accept_ranges: false, throttle: Some(MIB), ..ServerConfig::sized(size) });
     let dir = TempDir::new("noaccept");
     let run = run_download(request(server.url("/files/x.bin"), dir.path()), opts(4), None).await;
     let (path, _) = completed(&run);

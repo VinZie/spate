@@ -27,6 +27,10 @@ jobs:
         run: cargo build --workspace --all-targets --locked
       - name: Test
         run: cargo test --workspace --locked
+        env:
+          # Engine tests measure throughput; running them side by side on a
+          # small runner makes the timings meaningless.
+          RUST_TEST_THREADS: 1
       - name: Clippy
         run: cargo clippy --workspace --all-targets --locked
 
