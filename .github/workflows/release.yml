@@ -2,24 +2,33 @@ name: Release
 
 # Push a tag such as v0.2.0 to build the Windows package and publish a release
 # with the zip and its SHA-256 checksum attached.
+#
+# Hardening: actions are pinned to commit SHAs (Dependabot keeps them
+# current); the build job can only read the repository and uses no caches;
+# only the small publish job can write, and it runs no third-party code apart
+# from GitHub's own artifact and attestation actions.
 on:
   push:
     tags: ['v*']
 
-permissions:
-  contents: write
+permissions: {}
 
 jobs:
-  package:
-    name: Build and publish
+  build:
+    name: Build
     runs-on: windows-latest
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: actions/setup-node@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master, 2026-10-16
+        with:
+          toolchain: stable
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 22
-      - uses: Swatinem/rust-cache@v2
       - name: Test
         run: cargo test --workspace --locked
         env:
@@ -27,16 +36,49 @@ jobs:
       - name: Package
         shell: pwsh
         run: ./packaging/package-windows.ps1
-      - name: Publish release
-        uses: softprops/action-gh-release@v2
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          files: |
+          name: package
+          path: |
             dist/*.zip
             dist/*.zip.sha256
-          generate_release_notes: true
-          body: |
-            **Download:** the `windows-x64.zip` below (Windows 10 and 11, 64-bit). Unzip it and run `spate.exe`; the included `README.txt` covers browser integration.
+          if-no-files-found: error
 
-            The executables are not code-signed yet, so SmartScreen may warn on first run (More info → Run anyway). This zip was built by GitHub Actions from the tagged source; compare it with the `.sha256` file.
-
-            See [CHANGELOG.md](https://github.com/${{ github.repository }}/blob/${{ github.ref_name }}/CHANGELOG.md) for what changed.
+  publish:
+    name: Publish
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # create the release
+      id-token: write # sign the provenance attestation
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: package
+          path: dist
+      - name: Attest build provenance
+        # Artifact attestations need a public repository on GitHub's free plans.
+        if: ${{ !github.event.repository.private }}
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: dist/*.zip
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+          PRIVATE: ${{ github.event.repository.private }}
+        run: |
+          {
+            echo "**Download:** the \`windows-x64.zip\` below (Windows 10 and 11, 64-bit). Unzip it and run \`spate.exe\`; the included \`README.txt\` covers browser integration."
+            echo
+            echo "The executables are not code-signed yet, so SmartScreen may warn on first run (More info → Run anyway). GitHub Actions built this zip from the tagged source; compare it with the \`.sha256\` file."
+            if [ "$PRIVATE" != "true" ]; then
+              echo
+              echo "Verify where it was built with \`gh attestation verify <zip> --repo $GITHUB_REPOSITORY\`."
+            fi
+            echo
+            echo "See [CHANGELOG.md](https://github.com/$GITHUB_REPOSITORY/blob/$TAG/CHANGELOG.md) for what changed."
+          } > notes.md
+          gh release create "$TAG" dist/*.zip dist/*.zip.sha256 \
+            --repo "$GITHUB_REPOSITORY" --title "Spate ${TAG#v}" --notes-file notes.md --verify-tag
