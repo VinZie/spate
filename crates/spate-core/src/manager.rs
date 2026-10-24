@@ -276,6 +276,8 @@ struct Running {
     stop: Option<StopReason>,
     /// Files to delete once a removed download has stopped.
     remove_files: Vec<PathBuf>,
+    /// The removed record's resume point: it proves which partial file is its own.
+    remove_claim: Option<ResumeData>,
     speed: f64,
     last_received: u64,
     last_sample: Instant,
@@ -562,7 +564,7 @@ impl Manager {
     /// (or partial) file from disk.
     pub fn remove(&self, id: u64, delete_file: bool) {
         let inner = &self.inner;
-        let (running, to_delete) = {
+        let (running, to_delete, claims) = {
             let mut guard = inner.state.lock();
             let st = &mut *guard;
             let Some(idx) = st.records.iter().position(|r| r.id == id) else { return };
@@ -575,13 +577,14 @@ impl Manager {
                 // handles are closed.
                 if let Some(run) = st.running.get_mut(&id) {
                     run.remove_files = files;
+                    run.remove_claim = rec.resume.clone();
                 }
-                (true, Vec::new())
+                (true, Vec::new(), Vec::new())
             } else {
-                (false, files)
+                (false, files, rec.resume.into_iter().collect::<Vec<_>>())
             }
         };
-        delete_files(&to_delete);
+        delete_files(&to_delete, &claims);
         inner.notify_change();
         // Give a plain (UI) thread the courtesy of the file being gone on
         // return; never block inside the runtime.
@@ -605,8 +608,9 @@ impl Manager {
                 let in_use = paths_in_use(st, id);
                 let rec = &mut st.records[idx];
                 let parts = owned_files(rec, &in_use, false);
+                let claims: Vec<ResumeData> = rec.resume.iter().cloned().collect();
                 reset_progress(rec);
-                delete_files(&parts);
+                delete_files(&parts, &claims);
                 st.mark_dirty(SAVE_SOON);
                 self.inner.start_locked(st, id, false);
                 true
@@ -860,6 +864,7 @@ impl Inner {
                 by_queue,
                 stop: None,
                 remove_files: Vec::new(),
+            remove_claim: None,
                 speed: 0.0,
                 last_received: 0,
                 last_sample: Instant::now(),
@@ -886,6 +891,7 @@ impl Inner {
     /// Apply the outcome of an engine run.
     fn finish(self: &Arc<Self>, id: u64, generation: u64, result: Result<Outcome>) {
         let mut to_delete = Vec::new();
+        let mut claims: Vec<ResumeData> = Vec::new();
         let mut completed = None;
         let shutting_down;
         {
@@ -905,6 +911,8 @@ impl Inner {
             if let Some(StopReason::Remove { delete_file }) = run.stop {
                 if delete_file {
                     to_delete = run.remove_files;
+                    claims.extend(run.remove_claim);
+                    claims.extend(checkpoint.iter().cloned());
                     to_delete.extend(checkpoint.map(|c| c.part_path()));
                     to_delete.extend(info.map(|i| naming::with_suffix(&i.file_path, PART_SUFFIX)));
                     if let Ok(Outcome::Completed { path, .. }) = result {
@@ -917,9 +925,10 @@ impl Inner {
                 }
                 if run.stop == Some(StopReason::Restart) {
                     let mut parts = owned_files(rec, &in_use, false);
+                    let claims: Vec<ResumeData> = rec.resume.iter().cloned().chain(checkpoint.iter().cloned()).collect();
                     parts.extend(checkpoint.map(|c| c.part_path()));
                     reset_progress(rec);
-                    delete_files(&parts);
+                    delete_files(&parts, &claims);
                     st.retries.remove(&id);
                     self.start_locked(st, id, false);
                 } else {
@@ -984,7 +993,7 @@ impl Inner {
             self.pump_queue(st);
         }
 
-        delete_files(&to_delete);
+        delete_files(&to_delete, &claims);
         if let Some(path) = completed {
             let callback = self.on_complete.lock().clone();
             if let Some(f) = callback {
@@ -1368,8 +1377,19 @@ fn paths_in_use(st: &State, id: u64) -> HashSet<PathBuf> {
     used
 }
 
-fn delete_files(paths: &[PathBuf]) {
+/// Delete `paths`. A partial file that one of `claims` (the download's resume
+/// points) marks with an ownership token is deleted only while it still
+/// carries that token, so a file another download has since created at the
+/// same path is left alone.
+fn delete_files(paths: &[PathBuf], claims: &[ResumeData]) {
     for path in paths {
+        let mut claimed = claims.iter().filter(|c| c.part_token.is_some() && c.part_path() == *path).peekable();
+        if claimed.peek().is_some() {
+            if !claimed.any(download::discard_part) {
+                tracing::debug!(path = %path.display(), "partial file is gone or not this download's; left alone");
+            }
+            continue;
+        }
         match std::fs::remove_file(path) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -1395,12 +1415,9 @@ fn requested_name(rec: &DownloadRecord) -> Option<String> {
     (rec.name_chosen || rec.file_name != default_name(&rec.url, rec.kind)).then(|| rec.file_name.clone())
 }
 
-/// Request headers that carry credentials and are therefore never saved.
-pub fn is_credential_header(name: &str) -> bool {
-    const MARKERS: [&str; 10] = ["cookie", "auth", "token", "secret", "session", "password", "api-key", "apikey", "csrf", "xsrf"];
-    let name = name.trim().to_ascii_lowercase();
-    MARKERS.iter().any(|m| name.contains(m))
-}
+/// Request headers that carry credentials are never saved (the same list
+/// that keeps them on their own origin).
+pub use crate::http::is_credential_header;
 
 fn serialize_without_credentials<S: serde::Serializer>(
     headers: &[(String, String)],
@@ -1445,7 +1462,10 @@ async fn probe_url(url: &str, headers: &[(String, String)], net: &NetConfig) -> 
         return Err(Error::InvalidUrl(format!("unsupported scheme `{}`", parsed.scheme())));
     }
     let client = http::build_client(net)?;
-    let resp = client.get(parsed.clone()).headers(http::header_map(headers)).header(header::RANGE, "bytes=0-0").send().await?;
+    let mut extra = header::HeaderMap::new();
+    extra.insert(header::RANGE, header::HeaderValue::from_static("bytes=0-0"));
+    let resp =
+        http::get(&client, &parsed, &parsed, &http::header_map(headers), extra, net.max_redirects, |_| Ok(())).await?;
     let h = resp.headers();
     let (total, resumable) = match resp.status().as_u16() {
         206 => {
@@ -1593,6 +1613,41 @@ mod tests {
     const KIB: usize = 1024;
     const MIB: usize = 1024 * 1024;
     const TIMEOUT: Duration = Duration::from_secs(10);
+
+    #[test]
+    fn a_claimed_partial_file_is_deleted_only_while_it_carries_the_token() {
+        let dir = std::env::temp_dir().join(format!("spate-claims-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let token = [7u8; 16];
+        let claim = ResumeData {
+            final_url: "https://example.com/a.bin".into(),
+            file_path: dir.join("a.bin"),
+            total: Some(4),
+            resumable: true,
+            etag: None,
+            last_modified: None,
+            segments: Vec::new(),
+            part_token: Some(token.iter().map(|b| format!("{b:02x}")).collect()),
+        };
+        let part = claim.part_path();
+
+        // Another download has since created a partial file at the same path.
+        std::fs::write(&part, b"someone else's bytes").unwrap();
+        delete_files(std::slice::from_ref(&part), std::slice::from_ref(&claim));
+        assert!(part.exists(), "another download's partial file was deleted");
+
+        // Our own file (it ends with the token) goes.
+        std::fs::write(&part, [&b"data"[..], &token].concat()).unwrap();
+        delete_files(std::slice::from_ref(&part), std::slice::from_ref(&claim));
+        assert!(!part.exists());
+
+        // Files no resume point claims are deleted by path, as before.
+        let other = dir.join("b.bin.part");
+        std::fs::write(&other, b"x").unwrap();
+        delete_files(std::slice::from_ref(&other), std::slice::from_ref(&claim));
+        assert!(!other.exists());
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     // ---- minimal HTTP/1.1 range server -------------------------------------
 

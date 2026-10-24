@@ -901,3 +901,23 @@ async fn simultaneous_downloads_of_one_name_get_separate_files() {
     assert_file_eq(&pb, &b.body());
     no_part_files(&dir);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_confirmed_name_gets_no_extension_from_the_server() {
+    // `invoice` confirmed by the user must not become `invoice.exe` because
+    // the server says the body is a Windows program.
+    let server = TestServer::start(ServerConfig {
+        content_type: Some("application/x-msdownload".into()),
+        ..ServerConfig::sized(64 * KIB)
+    });
+    let dir = TempDir::new("confirmed-name");
+    let mut req = request(server.url("/files/get"), dir.path());
+    req.file_name = Some("invoice".into());
+    let (path, _) = completed(&run_download(req, opts(2), None).await);
+    assert_eq!(path.file_name().unwrap(), "invoice");
+
+    // A name derived from the URL still gets one.
+    let (path, _) = completed(&run_download(request(server.url("/files/get"), dir.path()), opts(2), None).await);
+    assert_eq!(path.file_name().unwrap(), "get.exe");
+    no_part_files(&dir);
+}

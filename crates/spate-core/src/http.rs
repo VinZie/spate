@@ -168,8 +168,14 @@ pub fn header_map(headers: &[(String, String)]) -> HeaderMap {
     map
 }
 
-/// Request headers that carry the user's credentials for one site.
-const CREDENTIAL_HEADERS: [&str; 2] = ["cookie", "authorization"];
+/// Whether a request header carries the user's credentials for one site
+/// (cookies, `Authorization`, API keys, session and CSRF tokens): such headers
+/// stay on their origin and are never written to disk.
+pub fn is_credential_header(name: &str) -> bool {
+    const MARKERS: [&str; 10] = ["cookie", "auth", "token", "secret", "session", "password", "api-key", "apikey", "csrf", "xsrf"];
+    let name = name.trim().to_ascii_lowercase();
+    MARKERS.iter().any(|m| name.contains(m))
+}
 
 /// Whether credentials collected for `origin` may go with a request to
 /// `target`: same scheme, host and port only, which also rules out sending
@@ -180,15 +186,15 @@ pub fn same_origin(origin: &reqwest::Url, target: &reqwest::Url) -> bool {
         && origin.port_or_known_default() == target.port_or_known_default()
 }
 
-/// The headers to send to `target`. Cookies and `Authorization` were
-/// collected for `credentials_for` (the URL the user or browser handed us),
-/// so they are dropped for any other origin, such as a redirect target or a
-/// segment on a CDN. Use this for every request that doesn't go through
-/// reqwest's own redirect handling.
+/// The headers to send to `target`. Credentials (see
+/// [`is_credential_header`]) were collected for `credentials_for` (the URL
+/// the user or browser handed us), so they are dropped for any other origin,
+/// such as a redirect target or a segment on a CDN.
 pub fn scoped_headers(headers: &HeaderMap, credentials_for: &reqwest::Url, target: &reqwest::Url) -> HeaderMap {
     let mut scoped = headers.clone();
     if !same_origin(credentials_for, target) {
-        for name in CREDENTIAL_HEADERS {
+        let credentials: Vec<HeaderName> = scoped.keys().filter(|n| is_credential_header(n.as_str())).cloned().collect();
+        for name in credentials {
             scoped.remove(name);
         }
     }
@@ -244,6 +250,7 @@ mod tests {
         let h = header_map(&[
             ("Cookie".into(), "session=1".into()),
             ("Authorization".into(), "Bearer t".into()),
+            ("X-CSRF-Token".into(), "c".into()),
             ("Referer".into(), "https://site.example/".into()),
         ]);
         let origin = url("https://site.example/file.zip");
@@ -257,7 +264,9 @@ mod tests {
             "https://evil.site.example/file.zip", // a subdomain is another origin
         ] {
             let scoped = scoped_headers(&h, &origin, &url(target));
-            assert!(scoped.get("cookie").is_none() && scoped.get("authorization").is_none(), "{target}");
+            for credential in ["cookie", "authorization", "x-csrf-token"] {
+                assert!(scoped.get(credential).is_none(), "{credential} sent to {target}");
+            }
             assert_eq!(scoped.get("referer").unwrap(), "https://site.example/", "{target}");
         }
     }

@@ -682,7 +682,12 @@ impl Setup {
             .or_else(|| naming::from_url(&final_url))
             .or_else(|| naming::from_url(&url))
             .unwrap_or_else(|| "download".to_string());
-        if naming::split_ext(&name).1.is_empty()
+        // A name the user confirmed is kept exactly; only a derived name gets
+        // an extension from the server's Content-Type (else `invoice` could
+        // be saved as `invoice.exe`).
+        let requested = req.file_name.as_deref().is_some_and(|n| !n.trim().is_empty());
+        if !requested
+            && naming::split_ext(&name).1.is_empty()
             && let Some(ext) = content_type.as_deref().and_then(naming::extension_for_mime)
         {
             name = format!("{name}.{ext}");

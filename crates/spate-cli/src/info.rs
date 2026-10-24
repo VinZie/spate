@@ -93,14 +93,14 @@ pub async fn probe(url: &str, net: &NetArgs) -> Result<ProbeInfo, String> {
         return Err(format!("unsupported scheme `{}`", parsed.scheme()));
     }
     let settings = Settings::load(&paths::data_dir());
-    let client = http::build_client(&net.net_config(settings.net)).map_err(|e| e.to_string())?;
-    let resp = client
-        .get(parsed.clone())
-        .headers(http::header_map(&net.headers()))
-        .header(header::RANGE, "bytes=0-0")
-        .send()
-        .await
-        .map_err(|e| format!("request failed: {}", fmt::error_chain(&e)))?;
+    let config = net.net_config(settings.net);
+    let client = http::build_client(&config).map_err(|e| e.to_string())?;
+    let mut extra = header::HeaderMap::new();
+    extra.insert(header::RANGE, header::HeaderValue::from_static("bytes=0-0"));
+    let resp =
+        http::get(&client, &parsed, &parsed, &http::header_map(&net.headers()), extra, config.max_redirects, |_| Ok(()))
+            .await
+            .map_err(|e| format!("request failed: {}", fmt::error_chain(&e)))?;
     // Only the headers matter; dropping the response closes the connection
     // even if the server ignored the range and started a full body.
     interpret(&parsed, resp.url(), resp.status().as_u16(), resp.headers())

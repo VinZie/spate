@@ -285,7 +285,13 @@ async fn download_one(
     let mut existing = None;
     if let Some(found) = find_sidecar(dir, url, args.output.as_deref()) {
         if args.no_resume {
-            let _ = std::fs::remove_file(found.resume.part_path());
+            // Delete the partial file only while it still carries the token
+            // its resume point recorded (older sidecars have none).
+            if found.resume.part_token.is_some() {
+                spate_core::download::discard_part(&found.resume);
+            } else {
+                let _ = std::fs::remove_file(found.resume.part_path());
+            }
             let _ = std::fs::remove_file(&found.path);
         } else {
             if !args.quiet {
@@ -399,6 +405,7 @@ mod tests {
             etag: None,
             last_modified: None,
             segments: vec![Segment { start: 0, end: 100, done: 40 }],
+            part_token: None,
         }
     }
 
