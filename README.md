@@ -225,7 +225,7 @@ Not yet. The engine and command line are written to be portable, but only Window
 <a href="https://star-history.com/#VinZie/spate&Date">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=VinZie/spate&type=Date&theme=dark">
-    <img src="https://api.star-history.com/svg?repos=VinZie/spate&type=Date" width="600" alt="Star history chart for VinZie/spate">
+    <img src="https://api.star-history.com/svg?repos=VinZie/spate&type=Date" width="600" alt="Star history chart for this project/spate">
   </picture>
 </a>
 
