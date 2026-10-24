@@ -4,7 +4,8 @@
 
 /**
  * Collect unique http(s) links and media sources of the current document
- * (or only those touching the selection). Returns {pageUrl, title, links}.
+ * (or only those touching the selection). Returns {pageUrl, title, links};
+ * `pageUrl` has no fragment.
  */
 export function collectPageLinks(selectionOnly) {
   const MAX_LINKS = 2000;
@@ -35,7 +36,9 @@ export function collectPageLinks(selectionOnly) {
     if (href === pageHref || seen.has(href)) return;
     seen.add(href);
     const item = { url: href, kind };
-    const name = el && el.getAttribute ? el.getAttribute('download') : null;
+    // Like browsers, honour `download` only on links to this page's own
+    // origin (blob: and data: links are not collected at all).
+    const name = el && el.getAttribute && u.origin === location.origin ? el.getAttribute('download') : null;
     if (name) item.fileName = name;
     links.push(item);
   };
@@ -47,5 +50,5 @@ export function collectPageLinks(selectionOnly) {
     add(el.getAttribute('src') && el.src, 'media', null);
     if (el.currentSrc) add(el.currentSrc, 'media', null);
   }
-  return { pageUrl: location.href, title: document.title, links };
+  return { pageUrl: pageHref, title: document.title, links };
 }

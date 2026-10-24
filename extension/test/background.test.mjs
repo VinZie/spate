@@ -190,7 +190,7 @@ describe('Firefox bundle (browser.*, downloads.onCreated)', () => {
     const [msg] = nativeMessages(mock);
     assert.equal(msg.items[0].kind, 'hls');
     assert.equal(msg.items[0].fileName, 'A video_ part 1.ts');
-    assert.equal(msg.items[0].referrer, 'https://videos.example/watch?v=1');
+    assert.equal(msg.items[0].referrer, 'https://videos.example/'); // another origin: the page's origin only
     assert.equal(msg.items[0].fileSize, undefined);
 
     const dash = await message(mock, { cmd: 'download-media', tabId: 7, key: state.media[1].key });
@@ -205,7 +205,11 @@ describe('Firefox bundle (browser.*, downloads.onCreated)', () => {
   it('sends all links of a page as one interactive batch', async () => {
     const links = [
       { url: 'https://files.example/a/one.zip', kind: 'link' },
+      // Names from download attributes: not for another origin's file, never
+      // a shortcut type, and never a reason to treat a link as HLS.
       { url: 'https://mirror.example/two.iso', kind: 'link', fileName: 'two.iso' },
+      { url: 'https://files.example/a/get?id=3', kind: 'link', fileName: 'three.m3u8' },
+      { url: 'https://files.example/a/get?id=4', kind: 'link', fileName: 'four.lnk' },
     ];
     const mock = createMockBrowser({
       responses: baseResponses({
@@ -223,12 +227,123 @@ describe('Firefox bundle (browser.*, downloads.onCreated)', () => {
     const [msg] = nativeMessages(mock);
     assert.equal(msg.interactive, true);
     assert.deepEqual(
-      msg.items.map((i) => [i.url, i.cookies, i.fileName, i.referrer]),
+      msg.items.map((i) => [i.url, i.cookies, i.fileName, i.referrer, i.kind]),
       [
-        ['https://files.example/a/one.zip', 'sid=abc', undefined, 'https://files.example/a/'],
-        ['https://mirror.example/two.iso', undefined, 'two.iso', 'https://files.example/a/'],
+        ['https://files.example/a/one.zip', 'sid=abc', undefined, 'https://files.example/a/', 'http'],
+        ['https://mirror.example/two.iso', undefined, undefined, 'https://files.example/', 'http'],
+        ['https://files.example/a/get?id=3', 'sid=abc', 'three.m3u8', 'https://files.example/a/', 'http'],
+        ['https://files.example/a/get?id=4', 'sid=abc', undefined, 'https://files.example/a/', 'http'],
       ],
     );
+  });
+
+  describe('cookies and Referer, as the browser would send them for the page that started a download', () => {
+    const jar = [
+      { name: 'strict', value: '1', path: '/', sameSite: 'strict', hostOnly: true, domain: 'bank.example' },
+      { name: 'lax', value: '2', path: '/', sameSite: 'lax', hostOnly: true, domain: 'bank.example' },
+    ];
+    const setup = () => {
+      const mock = createMockBrowser({
+        responses: baseResponses({ 'cookies.getAll': (q) => (q.url.startsWith('https://bank.example/') ? jar : []) }),
+        omit: ['downloads.onDeterminingFilename'],
+      });
+      loadFirefoxBundle(mock);
+      return mock;
+    };
+    const statement = (id, extra = {}) => {
+      const url = `https://bank.example/statements/${id}.zip`;
+      return { ...zipItem, id, url, finalUrl: url, filename: `C:\\Users\\me\\Downloads\\${id}.zip`, referrer: undefined, ...extra };
+    };
+    const navigation = (url, extra = {}) => ({ tabId: 7, type: 'main_frame', method: 'GET', url, ...extra });
+    const sentFor = (mock) => Object.fromEntries(nativeMessages(mock).map((m) => [m.items[0].url, m.items[0]]));
+
+    it('applies the SameSite rules to browser downloads', async () => {
+      const mock = setup();
+      // A page of another site that suppressed its Referer (Firefox reports originUrl).
+      mock.fire('webRequest.onBeforeRequest', navigation('https://bank.example/statements/11.zip', { originUrl: 'https://evil.example/post' }));
+      mock.fire('downloads.onCreated', statement(11));
+      // An address the user typed: no initiator.
+      mock.fire('webRequest.onBeforeRequest', navigation('https://bank.example/statements/12.zip'));
+      mock.fire('downloads.onCreated', statement(12));
+      // Nothing known about the start and no Referer: treated as another site.
+      mock.fire('downloads.onCreated', statement(13));
+      // A page of the bank itself.
+      mock.fire('webRequest.onBeforeRequest', navigation('https://bank.example/statements/14.zip', { originUrl: 'https://bank.example/account#tab' }));
+      mock.fire('downloads.onCreated', statement(14, { referrer: 'https://bank.example/account' }));
+      // A page of another site with a full Referer (unsafe-url): trimmed to its origin.
+      mock.fire('downloads.onCreated', statement(15, { referrer: 'https://forum.example/t/1?p=2' }));
+      await settle();
+      const sent = sentFor(mock);
+      const of = (id) => sent[`https://bank.example/statements/${id}.zip`];
+      assert.deepEqual([of(11).cookies, of(11).referrer], ['lax=2', undefined]);
+      assert.deepEqual([of(12).cookies, of(12).referrer], ['strict=1; lax=2', undefined]);
+      assert.deepEqual([of(13).cookies, of(13).referrer], ['lax=2', undefined]);
+      assert.deepEqual([of(14).cookies, of(14).referrer], ['strict=1; lax=2', 'https://bank.example/account']);
+      assert.deepEqual([of(15).cookies, of(15).referrer], ['lax=2', 'https://forum.example/']);
+    });
+
+    it('applies them to links sent from the context menu', async () => {
+      const mock = setup();
+      const click = async (info) => {
+        mock.fire('contextMenus.onClicked', { menuItemId: 'spate-link', ...info }, { id: 7 });
+        await settle();
+        const all = nativeMessages(mock);
+        return all[all.length - 1].items[0];
+      };
+      const fromEvil = await click({ linkUrl: 'https://bank.example/statements/1.zip', pageUrl: 'https://evil.example/post#c1' });
+      assert.deepEqual([fromEvil.cookies, fromEvil.referrer], ['lax=2', 'https://evil.example/']);
+      // A frame of the bank inside the hostile page: the page around it loaded it.
+      const frame = await click({ frameUrl: 'https://bank.example/statements/view', pageUrl: 'https://evil.example/post' });
+      assert.deepEqual([frame.url, frame.cookies, frame.referrer], ['https://bank.example/statements/view', 'lax=2', 'https://evil.example/']);
+      const own = await click({ linkUrl: 'https://bank.example/statements/1.zip', pageUrl: 'https://bank.example/statements/#list' });
+      assert.deepEqual([own.cookies, own.referrer], ['strict=1; lax=2', 'https://bank.example/statements/']);
+    });
+  });
+
+  describe('media from frames of other sites', () => {
+    const video = (url, length, frame) => ({
+      tabId: 7,
+      url,
+      statusCode: 200,
+      type: 'media',
+      ...frame,
+      responseHeaders: [
+        { name: 'Content-Type', value: 'video/mp4' },
+        { name: 'Content-Length', value: String(length) },
+      ],
+    });
+    const page = { id: 7, url: 'https://videos.example/watch?v=1' };
+    const adVideo = video('https://ads.example/promo.mp4', 900_000_000, { frameId: 4, documentUrl: 'https://ads.example/frame' });
+
+    it('are passed over by "Download this video", though still listed', async () => {
+      const mock = createMockBrowser({ responses: baseResponses(), omit: ['downloads.onDeterminingFilename'] });
+      loadFirefoxBundle(mock);
+      mock.fire('webRequest.onHeadersReceived', video('https://cdn.videos.example/movie.mp4', 20_000_000, { frameId: 0, documentUrl: page.url }));
+      mock.fire('webRequest.onHeadersReceived', adVideo);
+      await settle();
+      mock.fire('contextMenus.onClicked', { menuItemId: 'spate-media', pageUrl: page.url }, page);
+      await settle();
+      assert.deepEqual(nativeMessages(mock).map((m) => m.items[0].url), ['https://cdn.videos.example/movie.mp4']);
+      const state = await message(mock, { cmd: 'popup-state', tabId: 7 });
+      assert.deepEqual(state.media.map((m) => m.url).sort(), ['https://ads.example/promo.mp4', 'https://cdn.videos.example/movie.mp4']);
+    });
+
+    it('are offered by name only, never as "this video"', async () => {
+      const mock = createMockBrowser({ responses: baseResponses(), omit: ['downloads.onDeterminingFilename'] });
+      loadFirefoxBundle(mock);
+      mock.fire('webRequest.onHeadersReceived', adVideo);
+      await settle(40); // the media menu is refreshed after a short delay
+      const parent = mock.callsTo('contextMenus.update').filter(([id]) => id === 'spate-media').pop();
+      assert.equal(parent[1].title, 'Download this video/stream with Spate (1)');
+      const child = mock.callsTo('contextMenus.create').filter(([p]) => p.parentId === 'spate-media').pop();
+      assert.match(child[0].title, /^MP4: promo\.mp4/);
+      mock.fire('contextMenus.onClicked', { menuItemId: 'spate-media', pageUrl: page.url }, page);
+      await settle();
+      assert.equal(nativeMessages(mock).length, 0);
+      mock.fire('contextMenus.onClicked', { menuItemId: 'spate-media:0', pageUrl: page.url }, page);
+      await settle();
+      assert.deepEqual(nativeMessages(mock).map((m) => m.items[0].url), ['https://ads.example/promo.mp4']);
+    });
   });
 });
 
@@ -260,11 +375,24 @@ describe('Chromium modules (chrome.* callbacks, onDeterminingFilename)', () => {
       assert.equal(suggested, 2);
       assert.equal(nativeMessages(mock).length, 1);
 
+      // Chromium reports the initiator's origin: a page of another site gets
+      // no SameSite=Strict cookies, even when it suppressed the Referer.
+      mock.responses['cookies.getAll'] = [
+        { name: 'strict', value: '1', path: '/', sameSite: 'strict', hostOnly: true, domain: 'files.example' },
+        { name: 'lax', value: '2', path: '/', sameSite: 'lax', hostOnly: true, domain: 'files.example' },
+      ];
+      const report = 'https://files.example/get/report.zip';
+      mock.fire('webRequest.onBeforeRequest', { tabId: 7, type: 'main_frame', method: 'GET', url: report, initiator: 'https://evil.example' });
+      listener({ ...zipItem, id: 9, url: report, finalUrl: report, filename: 'report.zip', referrer: '' }, () => (suggested += 1));
+      await settle();
+      assert.equal(suggested, 3);
+      assert.equal(nativeMessages(mock)[1].items[0].cookies, 'lax=2');
+
       // Host rejects: browser download resumes, still released once.
       mock.responses['runtime.sendNativeMessage'] = { ok: false, error: 'Spate is not running', version: '' };
       listener({ ...zipItem, id: 6 }, () => (suggested += 1));
       await settle();
-      assert.equal(suggested, 3);
+      assert.equal(suggested, 4);
       assert.deepEqual(mock.callsTo('downloads.resume'), [[6]]);
     } finally {
       delete globalThis.chrome;

@@ -116,10 +116,28 @@ export function parseHttpUrl(url) {
   }
 }
 
-/** Lower-case host name of an http(s) URL ('' otherwise). */
-export function hostOf(url) {
+/** Origin ("https://host:port") of an http(s) URL ('' otherwise). */
+export function originOf(url) {
   const u = parseHttpUrl(url);
-  return u ? u.hostname.toLowerCase() : '';
+  return u ? u.origin : '';
+}
+
+/**
+ * The Referer a browser sends by default (strict-origin-when-cross-origin)
+ * when the page at `pageUrl` opens `url`: the full address (without fragment
+ * or credentials) to the same origin, only the origin to other origins, and
+ * nothing from https to http or from a page that is not http(s).
+ */
+export function referrerFor(url, pageUrl) {
+  const page = parseHttpUrl(pageUrl);
+  const target = parseHttpUrl(url);
+  if (!page || !target) return undefined;
+  if (page.protocol === 'https:' && target.protocol === 'http:') return undefined;
+  if (page.origin !== target.origin) return `${page.origin}/`;
+  page.hash = '';
+  page.username = '';
+  page.password = '';
+  return page.href;
 }
 
 /**
@@ -386,22 +404,37 @@ export function mediaSupported(media) {
  * Pick the entry to download when the user asks for "this video":
  * the first HLS playlist detected (usually the master playlist), otherwise the
  * largest video, otherwise the largest audio. DASH is never picked.
+ *
+ * Only media loaded by the top-level page counts or, when it has none, media
+ * loaded by frames of the page's own origin (`pageUrl`): a frame from another
+ * site (an ad, say) must not win by loading something bigger. With `frameId`
+ * (the user pointed at a video inside that frame) that frame's media comes
+ * first. Anything else can still be chosen explicitly from the list.
  */
-export function pickBestMedia(list) {
+export function pickBestMedia(list, { pageUrl, frameId } = {}) {
   const usable = (list || []).filter(mediaSupported);
-  const hls = usable.filter((m) => m.kind === 'hls').sort((a, b) => (a.detectedAt ?? 0) - (b.detectedAt ?? 0));
+  const own = frameId > 0 ? usable.filter((m) => m.frameId === frameId) : [];
+  const top = usable.filter((m) => !m.frameId); // frame 0 (entries without frame info count as top-level)
+  const origin = originOf(pageUrl);
+  const sameOrigin = origin ? usable.filter((m) => m.frameId > 0 && m.frameOrigin === origin) : [];
+  const pool = [own, top, sameOrigin].find((l) => l.length) || [];
+  const hls = pool.filter((m) => m.kind === 'hls').sort((a, b) => (a.detectedAt ?? 0) - (b.detectedAt ?? 0));
   if (hls.length) return hls[0];
   const bySize = (a, b) => (b.size ?? 0) - (a.size ?? 0);
-  const video = usable.filter((m) => m.kind === 'video').sort(bySize);
+  const video = pool.filter((m) => m.kind === 'video').sort(bySize);
   if (video.length) return video[0];
-  const audio = usable.filter((m) => m.kind === 'audio').sort(bySize);
+  const audio = pool.filter((m) => m.kind === 'audio').sort(bySize);
   return audio[0] || null;
 }
 
-/** "hls" for HLS playlists, otherwise "http". */
-export function downloadKind(url, mime, fileName) {
+/**
+ * "hls" for HLS playlists, otherwise "http". Decided from the URL path and
+ * the reported MIME type only: a page-supplied file name must not be able to
+ * steer a link onto the HLS path.
+ */
+export function downloadKind(url, mime) {
   if (HLS_MIMES.has(baseMime(mime))) return 'hls';
-  if (fileExtension(fileName) === 'm3u8' || fileExtension(url) === 'm3u8') return 'hls';
+  if (fileExtension(url) === 'm3u8') return 'hls';
   return 'http';
 }
 
@@ -419,18 +452,46 @@ function siteHost(site) {
 }
 
 /**
- * Keep the cookies a browser would send for a request made from a page on
- * `topLevelHost`: all unpartitioned cookies, plus partitioned (CHIPS)
- * cookies whose partition's top-level site is that host or a parent of it.
+ * Keep the cookies (cookies.getAll results for `url`) a browser would send
+ * when `initiator`, the URL or origin of the page that starts the download,
+ * opens `url` as a top-level GET navigation, which is what a download is.
+ * `initiator` undefined (or null) means the user typed or pasted the address;
+ * one that is not http(s), such as an opaque origin ("null"), counts as
+ * another site.
+ *
+ * - Partitioned (CHIPS) cookies only when their partition's top-level site is
+ *   the initiator's host (the URL's host when there is none) or a parent of it.
+ * - From another site, SameSite=Strict cookies stay behind and SameSite=None
+ *   ones only go over https; Lax and unspecified ones go along.
+ *
+ * Sites are scheme-aware. Without a public suffix list, two hosts count as
+ * the same site only when they are equal or, for a domain cookie, both under
+ * the cookie's domain: browsers refuse domain cookies on public suffixes, and
+ * a page under that domain is sent that cookie by the browser anyway. So a
+ * host-only Strict cookie stays behind when a sibling subdomain starts the
+ * download, where the browser would send it.
  */
-export function selectCookies(cookies, topLevelHost) {
-  const host = String(topLevelHost || '').toLowerCase();
+export function selectCookies(cookies, url, initiator) {
+  const target = parseHttpUrl(url);
+  if (!target) return [];
+  const page = initiator === undefined || initiator === null ? target : parseHttpUrl(initiator);
+  const topHost = (page || target).hostname.toLowerCase();
+  const sameSiteFor = (c) => {
+    if (!page || page.protocol !== target.protocol) return false;
+    if (page.hostname === target.hostname) return true;
+    const domain = c.hostOnly === false ? String(c.domain || '').replace(/^\./, '').toLowerCase() : '';
+    return Boolean(domain) && (page.hostname === domain || page.hostname.endsWith(`.${domain}`));
+  };
   return (cookies || []).filter((c) => {
-    const site = c && c.partitionKey && c.partitionKey.topLevelSite;
-    if (!site) return true;
-    if (!host) return false;
-    const h = siteHost(site);
-    return host === h || host.endsWith(`.${h}`);
+    if (!c) return false;
+    const site = c.partitionKey && c.partitionKey.topLevelSite;
+    if (site) {
+      const h = siteHost(site);
+      if (topHost !== h && !topHost.endsWith(`.${h}`)) return false;
+    }
+    if (c.sameSite === 'strict') return sameSiteFor(c);
+    if (c.sameSite === 'no_restriction') return target.protocol === 'https:' || sameSiteFor(c);
+    return true;
   });
 }
 
@@ -496,6 +557,39 @@ export function fileNameFromUrl(url) {
     /* keep raw */
   }
   return sanitizeFileName(seg);
+}
+
+/** Windows shortcut and shell-command types (opening one can run or fetch something else). */
+const DANGEROUS_EXTENSIONS = [
+  'lnk', 'pif', 'url', 'website', 'scf', 'shb', 'shs', 'xnk', 'desklink', 'appref-ms',
+  'library-ms', 'search-ms', 'searchconnector-ms', 'settingcontent-ms',
+];
+
+/** Whether `name` has one of those types (Windows ignores trailing dots and spaces). */
+export function isDangerousFileName(name) {
+  const s = String(name || '').toLowerCase().replace(/[.\s]+$/, '');
+  return DANGEROUS_EXTENSIONS.some((ext) => s.endsWith(`.${ext}`));
+}
+
+/**
+ * Sanitized file name to hand to Spate, or '' for a dangerous type: the item
+ * then goes without a name and Spate names it from the server or the URL.
+ */
+export function safeFileName(name) {
+  const s = sanitizeFileName(name);
+  return isDangerousFileName(s) ? '' : s;
+}
+
+/**
+ * The name from a link's `download` attribute, honoured as browsers do: only
+ * for links to the page's own origin (and blob:/data: URLs), never to name
+ * another site's file. '' otherwise or when it is a dangerous type.
+ */
+export function downloadAttributeName(name, url, pageUrl) {
+  if (!name) return '';
+  const origin = originOf(url);
+  const local = /^(blob|data):/i.test(String(url)) || (origin !== '' && origin === originOf(pageUrl));
+  return local ? safeFileName(name) : '';
 }
 
 /**

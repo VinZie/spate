@@ -13,20 +13,23 @@ import {
   buildCookieHeader,
   classifyMedia,
   cleanItem,
+  downloadAttributeName,
   downloadKind,
   fileNameFromUrl,
   formatSize,
   headerMap,
-  hostOf,
   mediaFileName,
   mediaKey,
   mediaLabel,
   mediaSupported,
   normalizeSettings,
+  originOf,
   parseHttpUrl,
   pickBestMedia,
   positiveInt,
+  referrerFor,
   responseSize,
+  safeFileName,
   sanitizeFileName,
   selectCookies,
   shortUrl,
@@ -134,8 +137,11 @@ async function setTabBadge(tabId, count) {
 // Building download items
 // ---------------------------------------------------------------------------
 
-/** Cookie header the browser would send for `url` from a page on `referrer`. */
-async function cookieHeaderFor(url, { referrer, incognito, cookieStoreId } = {}) {
+/**
+ * Cookie header the browser would send for `url` when `initiator` (page URL
+ * or origin; undefined for an address the user typed) navigates to it.
+ */
+async function cookieHeaderFor(url, { initiator, incognito, cookieStoreId } = {}) {
   if (!api.cookies) return '';
   const query = { url };
   if (cookieStoreId) query.storeId = cookieStoreId;
@@ -148,21 +154,26 @@ async function cookieHeaderFor(url, { referrer, incognito, cookieStoreId } = {})
   } catch {
     cookies = await call(api.cookies, 'getAll', query).catch(() => []);
   }
-  return buildCookieHeader(selectCookies(cookies, hostOf(referrer) || hostOf(url)));
+  return buildCookieHeader(selectCookies(cookies, url, initiator));
 }
 
-/** A `download` request item in the native-host format (unknown fields omitted). */
-async function describeDownload({ url, fileName, referrer, mime, size, incognito, cookieStoreId, kind, cookies }) {
-  const cookieHeader = cookies !== undefined ? cookies : await cookieHeaderFor(url, { referrer, incognito, cookieStoreId });
+/**
+ * A `download` request item in the native-host format (unknown fields
+ * omitted). `referrer` is the address of the page the download comes from
+ * (the Referer is derived from it); `initiator` is who started the request,
+ * for the cookie rules (see selectCookies).
+ */
+async function describeDownload({ url, fileName, referrer, initiator, mime, size, incognito, cookieStoreId, kind, cookies }) {
+  const cookieHeader = cookies !== undefined ? cookies : await cookieHeaderFor(url, { initiator, incognito, cookieStoreId });
   return cleanItem({
     url,
-    fileName: fileName ? sanitizeFileName(fileName) : undefined,
-    referrer: parseHttpUrl(referrer) ? referrer : undefined,
+    fileName: fileName ? safeFileName(fileName) : undefined,
+    referrer: referrerFor(url, referrer),
     cookies: cookieHeader,
     userAgent: globalThis.navigator ? navigator.userAgent : undefined,
     fileSize: positiveInt(size),
     mime: baseMime(mime) || undefined,
-    kind: kind || downloadKind(url, mime, fileName),
+    kind: kind || downloadKind(url, mime),
   });
 }
 
@@ -179,7 +190,7 @@ async function sendItems(items, interactive, what) {
 
 // The downloads API does not expose the request method, so remember recent
 // form submissions (POST navigations): their responses cannot be re-fetched.
-const POST_MEMORY_MS = 120000;
+const REQUEST_MEMORY_MS = 120000;
 const recentPosts = new Map(); // url -> time
 
 function rememberPost(details) {
@@ -191,7 +202,31 @@ function rememberPost(details) {
 
 function wasPosted(...urls) {
   const now = Date.now();
-  return urls.some((u) => u && recentPosts.has(u) && now - recentPosts.get(u) < POST_MEMORY_MS);
+  return urls.some((u) => u && recentPosts.has(u) && now - recentPosts.get(u) < REQUEST_MEMORY_MS);
+}
+
+// Nor does it say who started a download, which decides the SameSite cookies
+// that may go along (the referrer is no substitute: a page can suppress it).
+// Chromium reports the initiator's origin ("null" when opaque), Firefox the
+// initiating document's URL; neither is set for an address the user typed.
+const recentStarts = new Map(); // url without fragment -> {at, initiator}
+const startKey = (url) => String(url).replace(/#.*$/, '');
+
+function rememberInitiator(details) {
+  const key = startKey(details.url);
+  recentStarts.delete(key);
+  recentStarts.set(key, { at: Date.now(), initiator: details.initiator ?? details.originUrl });
+  if (recentStarts.size > 200) recentStarts.delete(recentStarts.keys().next().value);
+}
+
+/** Initiator of a browser download (see selectCookies); unknown counts as another site. */
+function downloadInitiator(item) {
+  const now = Date.now();
+  for (const u of [item.url, item.finalUrl]) {
+    const seen = u && recentStarts.get(startKey(u));
+    if (seen && now - seen.at < REQUEST_MEMORY_MS) return seen.initiator;
+  }
+  return item.referrer || 'null';
 }
 
 /**
@@ -226,6 +261,7 @@ async function handleBrowserDownload(item, release) {
     url,
     fileName,
     referrer: item.referrer,
+    initiator: downloadInitiator(item),
     mime: item.mime,
     size,
     incognito: item.incognito,
@@ -384,6 +420,13 @@ function scheduleMediaMenu(tabId) {
 async function refreshMediaMenu(tabId) {
   const id = tabId ?? (await activeTabId());
   const list = id === undefined ? [] : mediaMenuOrder(await getTabMedia(id));
+  // One entry gets a plain item, unless the automatic pick passes over it
+  // (it comes from another site's frame): then it is listed by name.
+  let plain = list.length === 1;
+  if (plain && mediaSupported(list[0])) {
+    const tab = await call(api.tabs, 'get', id).catch(() => null);
+    plain = Boolean(pickBestMedia(list, { pageUrl: tab && tab.url }));
+  }
   await menuOp(async () => {
     for (let i = 0; i < mediaMenuChildren; i += 1) {
       await call(api.contextMenus, 'remove', `${MENU_MEDIA_CHILD}${i}`).catch(() => {});
@@ -393,7 +436,7 @@ async function refreshMediaMenu(tabId) {
       await call(api.contextMenus, 'update', MENU_MEDIA, { visible: false }).catch(() => {});
       return;
     }
-    if (list.length === 1) {
+    if (plain) {
       const m = list[0];
       await call(api.contextMenus, 'update', MENU_MEDIA, {
         visible: true,
@@ -430,15 +473,19 @@ async function onMenuClicked(info, tab) {
       // A <video> fed by Media Source Extensions has a blob: URL; offer the
       // stream detected on the page instead.
       if (tab && (info.mediaType === 'video' || info.mediaType === 'audio')) {
-        const best = pickBestMedia(await getTabMedia(tab.id));
+        const best = pickBestMedia(await getTabMedia(tab.id), { pageUrl: tab.url, frameId: info.frameId });
         if (best) return downloadMedia(tab.id, best, tab);
       }
       return setLastError('That item has no http(s) address Spate could download');
     }
-    const referrer = id === MENU_DOWNLOADS_PAGE ? undefined : info.frameUrl || info.pageUrl;
+    // The document the item is on (for a frame itself, the page around it);
+    // links on the browser's own downloads page count as a typed address.
+    const typed = id === MENU_DOWNLOADS_PAGE;
+    const page = info.linkUrl || info.srcUrl ? info.frameUrl || info.pageUrl : info.pageUrl;
     const item = await describeDownload({
       url: target,
-      referrer,
+      referrer: typed ? undefined : page,
+      initiator: typed ? undefined : page || 'null',
       incognito: tab && tab.incognito,
       cookieStoreId: tab && tab.cookieStoreId,
     });
@@ -449,7 +496,7 @@ async function onMenuClicked(info, tab) {
     return downloadPageLinks(tab, info.frameId || 0, id === MENU_SELECTED_LINKS);
   }
   if (id === MENU_MEDIA && tab) {
-    const best = pickBestMedia(await getTabMedia(tab.id));
+    const best = pickBestMedia(await getTabMedia(tab.id), { pageUrl: tab.url });
     if (best) return downloadMedia(tab.id, best, tab);
     return setLastError('No downloadable video or audio was detected on this page');
   }
@@ -514,21 +561,23 @@ async function downloadPageLinks(tab, frameId, selectionOnly) {
     await setLastError(error);
     return { ok: false, error };
   }
-  // Cookies depend on host and path; links in one directory share them.
+  // The links are opened from the page (or frame) they were collected on.
+  const page = typeof data.pageUrl === 'string' ? data.pageUrl : 'null';
+  // Cookies depend on origin and path; links in one directory share them.
   const cookieCache = new Map();
   const cookiesFor = (url) => {
     const u = new URL(url);
     const key = `${u.origin}${u.pathname.replace(/[^/]*$/, '')}`;
     if (!cookieCache.has(key)) {
-      cookieCache.set(key, cookieHeaderFor(url, { referrer: data.pageUrl, incognito: tab.incognito, cookieStoreId: tab.cookieStoreId }));
+      cookieCache.set(key, cookieHeaderFor(url, { initiator: page, incognito: tab.incognito, cookieStoreId: tab.cookieStoreId }));
     }
     return cookieCache.get(key);
   };
   const items = await mapLimit(data.links, 8, async (link) =>
     describeDownload({
       url: link.url,
-      fileName: link.fileName,
-      referrer: data.pageUrl,
+      fileName: downloadAttributeName(link.fileName, link.url, page),
+      referrer: page,
       cookies: await cookiesFor(link.url),
     }),
   );
@@ -545,12 +594,13 @@ async function downloadMedia(tabId, media, tabHint) {
     return { ok: false, error: 'DASH (.mpd) streams are not supported by Spate yet' };
   }
   const tab = (await call(api.tabs, 'get', tabId).catch(() => null)) || tabHint || {};
-  const referrer = parseHttpUrl(tab.url) ? tab.url : media.pageUrl;
+  const page = parseHttpUrl(tab.url) ? tab.url : media.pageUrl;
   const isHls = media.kind === 'hls';
   const item = await describeDownload({
     url: media.url,
     fileName: mediaFileName(media, tab.title),
-    referrer,
+    referrer: page,
+    initiator: page || 'null',
     mime: media.mime,
     size: isHls ? undefined : media.size, // a playlist's size says nothing about the stream
     incognito: tab.incognito,
@@ -580,6 +630,12 @@ function onMediaHeaders(details) {
     ext: media.ext,
     size: media.size,
     pageUrl: details.documentUrl || details.originUrl || details.initiator || null,
+    // Which document loaded it, so that pickBestMedia can pass over frames
+    // of other sites (a frame showing the media itself has the media's origin).
+    frameId: details.frameId,
+    frameOrigin: /^(main|sub)_frame$/.test(details.type)
+      ? originOf(details.url)
+      : details.initiator || originOf(details.documentUrl),
     detectedAt: Date.now(),
   };
   addTabMedia(tabId, entry)
@@ -598,6 +654,8 @@ if (api.webRequest) {
     api.webRequest.onHeadersReceived.addListener(onMediaHeaders, { urls: WEB_REQUESTS }, ['responseHeaders']);
   }
   api.webRequest.onBeforeRequest.addListener(rememberPost, { urls: WEB_REQUESTS, types: ['main_frame', 'sub_frame'] });
+  // `other` covers download requests that are not navigations (<a download>).
+  api.webRequest.onBeforeRequest.addListener(rememberInitiator, { urls: WEB_REQUESTS, types: ['main_frame', 'sub_frame', 'other'] });
 }
 
 if (api.webNavigation) {
