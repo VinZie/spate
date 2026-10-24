@@ -20,4 +20,20 @@ First public release.
 - Browser extension for Chrome, Edge, Brave and Firefox (Manifest V3): download capture, context menus, media and HLS detection.
 - Portable Windows package with the extension, a quick-start guide and third-party license texts.
 
+### Security
+
+Hardening from a security review before the first release:
+
+- Cookies, `Authorization` and other login headers are sent only to the origin they were collected for. Spate follows redirects itself and re-checks every hop, including for HLS playlists, segments and keys, and never sends them over plain http after https.
+- Every finished download carries the Mark of the Web (`Zone.Identifier`), so SmartScreen and Office Protected View apply.
+- Capture dialogs no longer take focus; their buttons wait about a second, held keys are ignored, and Enter opens only downloads the user selected.
+- The name the user confirms is the name saved; names lose bidirectional-text and invisible characters, and reserved device names are caught.
+- Requests made before the user confirms carry no credentials, and clipboard links are not fetched until the user asks.
+- Login headers are never written to disk; old download lists are scrubbed.
+- The app proves it knows the IPC token before helpers send it anything.
+- Partial files carry an ownership token, so stale resume data can't take over another download's file; checksums are verified before the final rename.
+- HLS: bounded memory for playlists and segments, and public playlists can't point at local network addresses.
+- Browser extension: only the cookies the browser itself would send (SameSite rules), strict-origin-when-cross-origin Referer, no HLS detection or dangerous file names from page-supplied `download` attributes, and media in other sites' frames isn't picked automatically.
+- Release workflow: actions pinned to commit SHAs, a read-only build job, and build provenance attestations for public releases.
+
 [0.1.0]: https://github.com/VinZie/spate/releases/tag/v0.1.0

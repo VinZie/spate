@@ -131,7 +131,12 @@ Measured in October 2026 on one Windows 11 PC with the release build. More conne
 ## Security and privacy
 
 - **No local web server.** Spate never listens for WebSocket or HTTP requests from web pages and sends no CORS headers, so a website cannot start or read downloads.
-- **Two locks on the browser bridge.** Browsers only let the extension IDs registered in the host manifest start `spate-cli`, and the host checks the caller's origin again. The app accepts commands only with the token from `ipc.json`.
+- **Locks on the browser bridge.** Browsers only let the extension IDs registered in the host manifest start `spate-cli`, and the host checks the caller's origin again. The app accepts commands only with the token from `ipc.json`, and proves it knows that token before a helper sends it anything, so a program squatting on a stale port learns nothing.
+- **Credentials stay with their site.** Cookies, `Authorization` and other login headers go only to the exact scheme, host and port they were collected for. Spate follows redirects itself and checks every hop, so they never reach a redirect target, a CDN segment or plain http. The extension hands over only the cookies the browser itself would send (SameSite rules included) and trims the Referer the way browsers do.
+- **Nothing secret on disk.** Login headers live in memory for the current session only and are never written to the download list.
+- **Downloads are marked as from the internet.** Every finished file carries the Mark of the Web, so SmartScreen, Office Protected View and the macro block treat it like a browser download.
+- **No surprise clicks.** A captured download never steals focus: the taskbar button flashes instead. Its Start button waits about a second, held keys are ignored, and Enter only opens a download you picked yourself. The name you confirm is the name that's saved.
+- **Careful with files.** File names are cleaned of reserved device names, bidirectional-text tricks and invisible characters. A partial file carries a random token, so Spate never resumes into or deletes a file it didn't create, and a file that fails its checksum never gets its final name.
 - **Least privilege.** Everything runs as your user. Browser registration writes only under `HKCU`, and the extension asks for the minimum permissions, each explained in [`extension/README.md`](extension/README.md).
 - **No telemetry.** Spate only connects to the servers you download from.
 
@@ -181,6 +186,18 @@ The extension isn't published in the Chrome Web Store or on Firefox Add-ons yet.
 <summary><b>Can Spate download videos?</b></summary>
 
 It downloads HLS streams (`.m3u8`), which the extension detects on the page. DASH streams and an in-page download button are on the roadmap.
+</details>
+
+<details>
+<summary><b>Why is the Start button greyed out for a moment?</b></summary>
+
+When a download arrives from your browser or the clipboard, its dialog ignores clicks and Enter for about a second, so a web page can't get a file confirmed while you happen to be typing.
+</details>
+
+<details>
+<summary><b>A download that needed me to be logged in fails after restarting Spate. Why?</b></summary>
+
+Spate keeps login cookies in memory only and never writes them to disk. After a restart, start the download again from your browser so the extension can hand over fresh cookies.
 </details>
 
 <details>
