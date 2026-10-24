@@ -60,6 +60,9 @@ pub fn init_tls() {
 /// Build a client. Each download connection gets its own client so that every
 /// connection is a separate TCP stream, even against HTTP/2 servers that
 /// would otherwise multiplex them all onto one socket.
+///
+/// The client does not follow redirects; send requests through [`get`],
+/// which follows them with the credentials scoped to every hop.
 pub fn build_client(cfg: &NetConfig) -> Result<reqwest::Client> {
     init_tls();
     let ua = cfg.user_agent.trim();
@@ -67,7 +70,7 @@ pub fn build_client(cfg: &NetConfig) -> Result<reqwest::Client> {
     let mut b = reqwest::Client::builder()
         .user_agent(ua.to_string())
         .connect_timeout(Duration::from_secs(cfg.connect_timeout_secs.max(1)))
-        .redirect(reqwest::redirect::Policy::limited(cfg.max_redirects))
+        .redirect(reqwest::redirect::Policy::none())
         .tcp_nodelay(true)
         .pool_max_idle_per_host(2)
         .http2_adaptive_window(true);
@@ -75,6 +78,56 @@ pub fn build_client(cfg: &NetConfig) -> Result<reqwest::Client> {
         b = b.proxy(reqwest::Proxy::all(proxy.trim()).map_err(|e| Error::Other(format!("invalid proxy: {e}")))?);
     }
     Ok(b.build()?)
+}
+
+/// GET `url` with `headers` (collected for `credentials_for`) plus `extra`,
+/// following redirects. Each hop is sent the headers scoped to it, so cookies
+/// and `Authorization` reach `credentials_for`'s origin only: not another
+/// host, not a later hop there, not plain http after https. (reqwest's own
+/// redirect handling restores the first request's headers on every hop and
+/// compares only with the previous one, so A -> B -> B/x would hand A's
+/// cookie to B.) `allow_hop` vets each redirect target before it is requested.
+pub async fn get(
+    client: &reqwest::Client,
+    url: &reqwest::Url,
+    credentials_for: &reqwest::Url,
+    headers: &HeaderMap,
+    extra: HeaderMap,
+    max_redirects: usize,
+    allow_hop: impl Fn(&reqwest::Url) -> Result<()>,
+) -> Result<reqwest::Response> {
+    use reqwest::StatusCode;
+
+    let mut url = url.clone();
+    let mut hops = 0;
+    loop {
+        let mut h = scoped_headers(headers, credentials_for, &url);
+        for (name, value) in &extra {
+            h.insert(name, value.clone());
+        }
+        let resp = client.get(url.clone()).headers(h).send().await?;
+        let redirect = matches!(
+            resp.status(),
+            StatusCode::MOVED_PERMANENTLY
+                | StatusCode::FOUND
+                | StatusCode::SEE_OTHER
+                | StatusCode::TEMPORARY_REDIRECT
+                | StatusCode::PERMANENT_REDIRECT
+        );
+        let Some(location) = header_str(resp.headers(), reqwest::header::LOCATION).filter(|_| redirect) else {
+            return Ok(resp);
+        };
+        let next = url.join(location).map_err(|e| Error::InvalidUrl(format!("bad redirect target: {e}")))?;
+        if !matches!(next.scheme(), "http" | "https") {
+            return Err(Error::InvalidUrl(format!("redirect to unsupported scheme `{}`", next.scheme())));
+        }
+        hops += 1;
+        if hops > max_redirects {
+            return Err(Error::Other("too many redirects".into()));
+        }
+        allow_hop(&next)?;
+        url = next;
+    }
 }
 
 /// Turn user/browser supplied headers into a `HeaderMap`, dropping any that

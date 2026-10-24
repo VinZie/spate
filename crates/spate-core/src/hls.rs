@@ -57,7 +57,7 @@ use cbc::cipher::block_padding::Pkcs7;
 use cbc::cipher::{BlockModeDecrypt, KeyIvInit};
 use parking_lot::Mutex;
 use reqwest::StatusCode;
-use reqwest::header::{self, HeaderMap};
+use reqwest::header::{self, HeaderMap, HeaderValue};
 use tokio::io::{AsyncWriteExt, BufWriter};
 use tokio::sync::{OnceCell, OwnedSemaphorePermit, Semaphore, watch};
 use tokio::task::{JoinError, JoinHandle};
@@ -1007,11 +1007,6 @@ impl Ctx {
         })
     }
 
-    /// `headers`, without the credentials unless `url` is on the origin.
-    fn headers_for(&self, url: &Url) -> HeaderMap {
-        http::scoped_headers(&self.headers, &self.origin, url)
-    }
-
     /// Refuse a URL that isn't http(s), or that points a playlist from the
     /// internet at this machine or the local network.
     fn check_url(&self, url: &Url) -> Result<()> {
@@ -1151,20 +1146,27 @@ impl Ctx {
         let track = matches!(what, Resource::Media { .. });
         let client = self.clients.lease();
         let _active = track.then(|| ActiveGuard::new(self.progress.active_counter()));
-        let mut rb = client.get(url.clone()).headers(self.headers_for(url));
+        let mut extra = HeaderMap::new();
         if let Some(r) = range {
-            rb = rb.header(header::RANGE, r.header_value());
+            extra.insert(header::RANGE, HeaderValue::from_str(&r.header_value()).expect("ASCII byte range"));
         }
+        // Redirects are followed by `http::get`, which scopes the credentials
+        // to every hop; `check_url` refuses a hop to a local address before
+        // it is requested.
+        let request = http::get(
+            &client,
+            url,
+            &self.origin,
+            &self.headers,
+            extra,
+            self.opts.net.max_redirects,
+            |hop| self.check_url(hop),
+        );
         let mut resp = tokio::select! {
             biased;
             _ = self.stop.cancelled() => return Err(cancelled()),
-            r = rb.send() => r?,
+            r = request => r?,
         };
-        // reqwest followed any redirects (dropping the credentials when the
-        // origin changed); don't use what a local address sent back.
-        if resp.url() != url {
-            self.check_url(resp.url())?;
-        }
         let status = resp.status();
         // `skip` leading bytes are dropped, at most `want` bytes are kept.
         let (mut skip, want) = match range {
@@ -1743,7 +1745,7 @@ mod tests {
         };
         let progress = Arc::new(Progress::default());
         let ctx = Ctx::new(&req, &EngineOptions::default(), &origin, progress, &CancellationToken::new()).unwrap();
-        let headers = |u: &str| ctx.headers_for(&Url::parse(u).unwrap());
+        let headers = |u: &str| http::scoped_headers(&ctx.headers, &ctx.origin, &Url::parse(u).unwrap());
         let same = headers("https://site.example/other/seg1.ts?x=1");
         assert_eq!(same.get("cookie").unwrap(), "s=1");
         assert_eq!(same.get("authorization").unwrap(), "Bearer t");

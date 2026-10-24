@@ -22,7 +22,7 @@
 //! validator) restarts the download from scratch, with a single connection
 //! if the data itself disagreed.
 //!
-//! Safety: redirects are followed here rather than by reqwest, and every hop
+//! Safety: redirects are followed by [`http::get`] rather than by reqwest, and every hop
 //! gets the headers scoped to it, so cookies and `Authorization` only ever
 //! reach the origin they were collected for. A partial file ends with a
 //! random token that the resume data records; a file without it belongs to
@@ -338,70 +338,6 @@ fn head_timeout(net: &NetConfig) -> Duration {
     Duration::from_secs(net.read_timeout_secs.max(1))
 }
 
-/// A client for one connection: the settings of [`http::build_client`]
-/// (keep the two in step), except that redirects are left to [`fetch`].
-fn build_client(net: &NetConfig) -> Result<reqwest::Client> {
-    http::init_tls();
-    let ua = net.user_agent.trim();
-    let ua = if ua.is_empty() || ua.starts_with(http::LEGACY_USER_AGENT_PREFIX) { http::DEFAULT_USER_AGENT } else { ua };
-    let mut b = reqwest::Client::builder()
-        .user_agent(ua.to_string())
-        .connect_timeout(Duration::from_secs(net.connect_timeout_secs.max(1)))
-        .redirect(reqwest::redirect::Policy::none())
-        .tcp_nodelay(true)
-        .pool_max_idle_per_host(2)
-        .http2_adaptive_window(true);
-    if let Some(proxy) = net.proxy.as_deref().filter(|p| !p.trim().is_empty()) {
-        b = b.proxy(reqwest::Proxy::all(proxy.trim()).map_err(|e| Error::Other(format!("invalid proxy: {e}")))?);
-    }
-    Ok(b.build()?)
-}
-
-/// GET `url` with `headers` (collected for `origin`) plus `extra`, following
-/// redirects. Each hop is sent the headers scoped to it, so cookies and
-/// `Authorization` reach `origin` only: not another host, not a later hop
-/// there, not plain http after https. (reqwest's own redirect handling
-/// restores the first request's headers on every hop and compares only with
-/// the previous one, so A -> B -> B/x would hand A's cookie to B.)
-async fn fetch(
-    client: &reqwest::Client,
-    url: &Url,
-    origin: &Url,
-    headers: &HeaderMap,
-    extra: HeaderMap,
-    max_redirects: usize,
-) -> Result<reqwest::Response> {
-    let mut url = url.clone();
-    let mut hops = 0;
-    loop {
-        let mut h = http::scoped_headers(headers, origin, &url);
-        for (name, value) in &extra {
-            h.insert(name, value.clone());
-        }
-        let resp = client.get(url.clone()).headers(h).send().await?;
-        let redirect = matches!(
-            resp.status(),
-            StatusCode::MOVED_PERMANENTLY
-                | StatusCode::FOUND
-                | StatusCode::SEE_OTHER
-                | StatusCode::TEMPORARY_REDIRECT
-                | StatusCode::PERMANENT_REDIRECT
-        );
-        let Some(location) = header_str(resp.headers(), header::LOCATION).filter(|_| redirect) else {
-            return Ok(resp);
-        };
-        let next = url.join(location).map_err(|e| Error::InvalidUrl(format!("bad redirect target: {e}")))?;
-        if !matches!(next.scheme(), "http" | "https") {
-            return Err(Error::InvalidUrl(format!("redirect to unsupported scheme `{}`", next.scheme())));
-        }
-        hops += 1;
-        if hops > max_redirects {
-            return Err(Error::Other("too many redirects".into()));
-        }
-        url = next;
-    }
-}
-
 async fn run_once(
     req: &DownloadRequest,
     opts: &EngineOptions,
@@ -419,7 +355,7 @@ async fn run_once(
     // resuming or restarting.
     let origin = url.clone();
     let headers = http::header_map(&req.headers);
-    let first_client = build_client(&opts.net)?;
+    let first_client = http::build_client(&opts.net)?;
 
     let mut fresh = None;
     let resumed = match resume.map(|r| Setup::resumed(url.clone(), r, opts)) {
@@ -501,7 +437,7 @@ async fn run_once(
         let initial = first_response.and_then(|r| ctx.progress.table.lock().claim(0).map(|slot| (slot, r)));
         set.spawn(worker(ctx.clone(), 0, first_client, initial, None));
         for id in 1..start_with {
-            set.spawn(worker(ctx.clone(), id, build_client(&opts.net)?, None, None));
+            set.spawn(worker(ctx.clone(), id, http::build_client(&opts.net)?, None, None));
         }
         let mut next_id = start_with;
         let mut probe_up_after = PROBE_UP_AFTER;
@@ -553,7 +489,7 @@ async fn run_once(
                         && !ctx.stop.is_cancelled()
                         && set.len() < ctx.limit.load(Ordering::SeqCst).min(target)
                         && ctx.progress.table.lock().can_claim();
-                    if wanted && let Ok(client) = build_client(&opts.net) {
+                    if wanted && let Ok(client) = http::build_client(&opts.net) {
                         let flag = Arc::new(AtomicBool::new(false));
                         set.spawn(worker(ctx.clone(), next_id, client, None, Some(flag.clone())));
                         next_id += 1;
@@ -703,7 +639,7 @@ impl Setup {
             if range {
                 extra.insert(header::RANGE, HeaderValue::from_static("bytes=0-"));
             }
-            tokio::time::timeout(timeout, fetch(client, &url, &url, headers, extra, opts.net.max_redirects))
+            tokio::time::timeout(timeout, http::get(client, &url, &url, headers, extra, opts.net.max_redirects, |_| Ok(())))
         };
         let stalled = |_| Error::Stalled(timeout.as_secs());
         let mut resp = send(true).await.map_err(stalled)??;
@@ -1051,7 +987,7 @@ impl Ctx {
             }
         }
         let timeout = self.read_timeout();
-        let send = fetch(client, &self.url, &self.origin, &self.headers, extra, self.opts.net.max_redirects);
+        let send = http::get(client, &self.url, &self.origin, &self.headers, extra, self.opts.net.max_redirects, |_| Ok(()));
         let resp = tokio::select! {
             r = tokio::time::timeout(timeout, send) => r.map_err(|_| Error::Stalled(timeout.as_secs()))??,
             _ = self.stop.cancelled() => return Ok(None),
