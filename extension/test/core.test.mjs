@@ -6,6 +6,7 @@ import {
   buildCookieHeader,
   classifyMedia,
   cleanItem,
+  downloadAttributeName,
   downloadKind,
   extensionMatches,
   fileExtension,
@@ -13,6 +14,7 @@ import {
   formatSize,
   globToRegExp,
   headerMap,
+  isDangerousFileName,
   isExcluded,
   mediaFileName,
   mediaKey,
@@ -22,7 +24,9 @@ import {
   parseExtensionList,
   parseSiteList,
   pickBestMedia,
+  referrerFor,
   responseSize,
+  safeFileName,
   sanitizeFileName,
   selectCookies,
   shortUrl,
@@ -214,15 +218,79 @@ describe('media classification', () => {
     assert.equal(pickBestMedia([...list, { kind: 'hls', url: 'variant', detectedAt: 9 }, { kind: 'hls', url: 'master', detectedAt: 4 }]).url, 'master');
     assert.equal(pickBestMedia([{ kind: 'dash', url: 'd' }]), null);
   });
+  it('picks media of the page itself, not of frames from other sites', () => {
+    const pageUrl = 'https://videos.example/watch?v=1';
+    const top = { kind: 'video', url: 'top', size: 2_000_000, frameId: 0, frameOrigin: 'https://videos.example' };
+    const own = { kind: 'video', url: 'own-frame', size: 5_000_000, frameId: 3, frameOrigin: 'https://videos.example' };
+    const ad = { kind: 'video', url: 'ad', size: 90_000_000, frameId: 4, frameOrigin: 'https://ads.example' };
+    const adHls = { kind: 'hls', url: 'ad-hls', frameId: 4, frameOrigin: 'https://ads.example', detectedAt: 1 };
+    const sandboxed = { kind: 'video', url: 'sandboxed', size: 90_000_000, frameId: 5, frameOrigin: 'null' };
+    assert.equal(pickBestMedia([ad, adHls, sandboxed, top, own], { pageUrl }).url, 'top');
+    assert.equal(pickBestMedia([ad, adHls, sandboxed, own], { pageUrl }).url, 'own-frame');
+    assert.equal(pickBestMedia([ad, adHls, sandboxed], { pageUrl }), null);
+    assert.equal(pickBestMedia([ad, own]), null); // without the page's address no frame counts as its own
+    // Pointing at a video inside a frame: that frame's media first.
+    assert.equal(pickBestMedia([ad, adHls, top], { pageUrl, frameId: 4 }).url, 'ad-hls');
+    assert.equal(pickBestMedia([ad, top], { pageUrl, frameId: 9 }).url, 'top');
+  });
   it('names media files from the URL or the page title', () => {
     assert.equal(mediaFileName({ kind: 'hls', url: 'https://x/master.m3u8' }, 'My: Video?'), 'My_ Video_.ts');
     assert.equal(mediaFileName({ kind: 'video', url: 'https://x/v/clip%20one.mp4', ext: 'mp4' }, 'Page'), 'clip one.mp4');
     assert.equal(mediaFileName({ kind: 'video', url: 'https://x/videoplayback', mime: 'video/webm' }, 'Page'), 'Page.webm');
   });
   it('downloadKind marks HLS playlists', () => {
-    assert.equal(downloadKind('https://x/a.m3u8', '', ''), 'hls');
-    assert.equal(downloadKind('https://x/get', 'application/vnd.apple.mpegurl', ''), 'hls');
-    assert.equal(downloadKind('https://x/a.zip', 'application/zip', 'a.zip'), 'http');
+    assert.equal(downloadKind('https://x/a.m3u8', ''), 'hls');
+    assert.equal(downloadKind('https://x/a.M3U8?tok=1', undefined), 'hls');
+    assert.equal(downloadKind('https://x/get', 'application/vnd.apple.mpegurl'), 'hls');
+    assert.equal(downloadKind('https://x/a.zip', 'application/zip'), 'http');
+  });
+  it('downloadKind ignores page-supplied names and query strings', () => {
+    // <a download="x.m3u8"> must not steer a link onto the HLS path.
+    assert.equal(downloadKind('https://bank.example/statement', '', 'x.m3u8'), 'http');
+    assert.equal(downloadKind('https://bank.example/get?f=list.m3u8', ''), 'http');
+  });
+});
+
+describe('referrer', () => {
+  const page = 'https://files.example/list?p=2#section';
+  it('sends the full address, without fragment or credentials, to the same origin', () => {
+    assert.equal(referrerFor('https://files.example/a.zip', page), 'https://files.example/list?p=2');
+    assert.equal(referrerFor('https://files.example/a.zip', 'https://me:pw@files.example/list#x'), 'https://files.example/list');
+    assert.equal(referrerFor('http://files.example/a.zip', 'http://files.example/list#x'), 'http://files.example/list');
+  });
+  it('sends only the origin to other origins', () => {
+    assert.equal(referrerFor('https://cdn.example/a.zip', page), 'https://files.example/');
+    assert.equal(referrerFor('https://files.example:8443/a.zip', page), 'https://files.example/');
+    assert.equal(referrerFor('https://files.example/a.zip', 'http://files.example/list'), 'http://files.example/');
+  });
+  it('sends nothing from https to http or from a page that is not http(s)', () => {
+    assert.equal(referrerFor('http://files.example/a.zip', page), undefined);
+    assert.equal(referrerFor('http://cdn.example/a.zip', page), undefined);
+    assert.equal(referrerFor('https://files.example/a.zip', 'file:///C:/list.html'), undefined);
+    assert.equal(referrerFor('https://files.example/a.zip', 'null'), undefined);
+    assert.equal(referrerFor('https://files.example/a.zip', undefined), undefined);
+  });
+});
+
+describe('page-supplied file names', () => {
+  it('refuses shortcut and shell-command types', () => {
+    for (const name of ['a.lnk', 'A.URL', 'x.scf', 'docs.library-ms', 'x.settingcontent-ms', 'q.search-ms', 'q.searchconnector-ms', 'app.appref-ms', 'x.pif', 'x.lnk. . ']) {
+      assert.ok(isDangerousFileName(name), name);
+    }
+    for (const name of ['report.pdf', 'lnk', 'url.txt', 'setup.exe']) assert.ok(!isDangerousFileName(name), name);
+    assert.equal(safeFileName('x.lnk  ..'), '');
+    assert.equal(safeFileName('a/b.zip'), 'a_b.zip');
+  });
+  it('honours download attributes only for same-origin, blob: and data: links', () => {
+    const page = 'https://files.example/a/';
+    assert.equal(downloadAttributeName('Report 2024.pdf', 'https://files.example/get?id=1', page), 'Report 2024.pdf');
+    assert.equal(downloadAttributeName('two.iso', 'https://mirror.example/two.iso', page), '');
+    assert.equal(downloadAttributeName('x.zip', 'http://files.example/x', page), '');
+    assert.equal(downloadAttributeName('x.zip', 'https://files.example/x', 'null'), '');
+    assert.equal(downloadAttributeName('clip.webm', 'blob:https://files.example/1', page), 'clip.webm');
+    assert.equal(downloadAttributeName('notes.txt', 'data:text/plain,hi', page), 'notes.txt');
+    assert.equal(downloadAttributeName('setup.lnk', 'https://files.example/setup', page), '');
+    assert.equal(downloadAttributeName(undefined, 'https://files.example/x', page), '');
   });
 });
 
@@ -246,8 +314,65 @@ describe('cookies', () => {
       { name: 'c', value: '3', partitionKey: { topLevelSite: 'https://other.com' } },
       { name: 'd', value: '4', partitionKey: {} },
     ];
-    assert.deepEqual(selectCookies(cookies, 'www.shop.com').map((c) => c.name), ['a', 'b', 'd']);
-    assert.deepEqual(selectCookies(cookies, '').map((c) => c.name), ['a', 'd']);
+    const names = (url, initiator) => selectCookies(cookies, url, initiator).map((c) => c.name);
+    assert.deepEqual(names('https://cdn.example/f.zip', 'https://www.shop.com/cart'), ['a', 'b', 'd']);
+    assert.deepEqual(names('https://cdn.example/f.zip', 'null'), ['a', 'd']);
+    assert.deepEqual(names('https://shop.com/f.zip'), ['a', 'b', 'd']); // typed: the URL's own site
+    assert.deepEqual(names('blob:https://shop.com/1'), []);
+  });
+
+  describe('SameSite, as for a top-level navigation from the initiating page', () => {
+    const jar = [
+      { name: 'strict', value: '1', sameSite: 'strict', hostOnly: true, domain: 'bank.example' },
+      { name: 'lax', value: '2', sameSite: 'lax', hostOnly: true, domain: 'bank.example' },
+      { name: 'none', value: '3', sameSite: 'no_restriction', secure: true, hostOnly: false, domain: '.bank.example' },
+      { name: 'plain', value: '4', sameSite: 'unspecified', hostOnly: true, domain: 'bank.example' },
+    ];
+    const names = (url, initiator, cookies = jar) => selectCookies(cookies, url, initiator).map((c) => c.name);
+    const file = 'https://bank.example/statements/2024.pdf';
+
+    it('sends everything for a typed address or a page of the same site', () => {
+      assert.deepEqual(names(file), ['strict', 'lax', 'none', 'plain']);
+      assert.deepEqual(names(file, null), ['strict', 'lax', 'none', 'plain']);
+      assert.deepEqual(names(file, 'https://bank.example/account#tab'), ['strict', 'lax', 'none', 'plain']);
+      assert.deepEqual(names(file, 'https://bank.example:8443'), ['strict', 'lax', 'none', 'plain']);
+    });
+    it('keeps Strict cookies from other sites, other schemes and opaque origins', () => {
+      for (const initiator of [
+        'https://evil.example/post',
+        'https://bank.example.evil.example/',
+        'https://evilbank.example/',
+        'http://bank.example/',
+        'null',
+        '',
+        'file:///C:/page.html',
+        'about:blank',
+      ]) {
+        assert.deepEqual(names(file, initiator), ['lax', 'none', 'plain'], initiator);
+      }
+    });
+    it('sends SameSite=None cookies to other sites only over https', () => {
+      const cookies = [{ name: 'none', value: '1', sameSite: 'no_restriction', hostOnly: true, domain: 'files.example' }];
+      assert.deepEqual(names('http://files.example/a.zip', 'https://forum.example/t/1', cookies), []);
+      assert.deepEqual(names('http://files.example/a.zip', 'http://files.example/', cookies), ['none']);
+      assert.deepEqual(names('http://files.example/a.zip', undefined, cookies), ['none']);
+      assert.deepEqual(names('https://files.example/a.zip', 'https://forum.example/t/1', cookies), ['none']);
+    });
+    it('counts a page under a domain cookie\'s domain as the same site for that cookie', () => {
+      const cookies = [
+        { name: 'wide', value: '1', sameSite: 'strict', hostOnly: false, domain: '.example.com' },
+        { name: 'host', value: '2', sameSite: 'strict', hostOnly: true, domain: 'dl.example.com' },
+      ];
+      const url = 'https://dl.example.com/a.zip';
+      assert.deepEqual(names(url, 'https://www.example.com/', cookies), ['wide']);
+      assert.deepEqual(names(url, 'https://example.com/', cookies), ['wide']);
+      assert.deepEqual(names(url, 'https://dl.example.com/', cookies), ['wide', 'host']);
+      assert.deepEqual(names(url, 'https://example.com.evil.net/', cookies), []);
+      assert.deepEqual(names(url, 'http://www.example.com/', cookies), []);
+      // Sites on a shared suffix (no domain cookie can span them) stay apart.
+      const pages = [{ name: 'gh', value: '1', sameSite: 'strict', hostOnly: true, domain: 'b.github.io' }];
+      assert.deepEqual(names('https://b.github.io/x.zip', 'https://a.github.io/', pages), []);
+    });
   });
 });
 
