@@ -115,6 +115,33 @@ pub fn header_map(headers: &[(String, String)]) -> HeaderMap {
     map
 }
 
+/// Request headers that carry the user's credentials for one site.
+const CREDENTIAL_HEADERS: [&str; 2] = ["cookie", "authorization"];
+
+/// Whether credentials collected for `origin` may go with a request to
+/// `target`: same scheme, host and port only, which also rules out sending
+/// them over plain http after an https → http redirect.
+pub fn same_origin(origin: &reqwest::Url, target: &reqwest::Url) -> bool {
+    origin.scheme() == target.scheme()
+        && origin.host_str() == target.host_str()
+        && origin.port_or_known_default() == target.port_or_known_default()
+}
+
+/// The headers to send to `target`. Cookies and `Authorization` were
+/// collected for `credentials_for` (the URL the user or browser handed us),
+/// so they are dropped for any other origin, such as a redirect target or a
+/// segment on a CDN. Use this for every request that doesn't go through
+/// reqwest's own redirect handling.
+pub fn scoped_headers(headers: &HeaderMap, credentials_for: &reqwest::Url, target: &reqwest::Url) -> HeaderMap {
+    let mut scoped = headers.clone();
+    if !same_origin(credentials_for, target) {
+        for name in CREDENTIAL_HEADERS {
+            scoped.remove(name);
+        }
+    }
+    scoped
+}
+
 /// Parse `bytes <first>-<last>/<total|*>`.
 pub fn parse_content_range(v: &str) -> Option<(u64, u64, Option<u64>)> {
     let rest = v.trim().strip_prefix("bytes")?.trim_start();
@@ -156,6 +183,30 @@ mod tests {
         assert!(m.get("range").is_none());
         assert_eq!(m.get("cookie").unwrap(), "a=b");
         assert_eq!(m.get("accept-encoding").unwrap(), "identity");
+    }
+
+    #[test]
+    fn credentials_stay_with_their_origin() {
+        let url = |s: &str| reqwest::Url::parse(s).unwrap();
+        let h = header_map(&[
+            ("Cookie".into(), "session=1".into()),
+            ("Authorization".into(), "Bearer t".into()),
+            ("Referer".into(), "https://site.example/".into()),
+        ]);
+        let origin = url("https://site.example/file.zip");
+        let same = scoped_headers(&h, &origin, &url("https://SITE.example:443/other?x"));
+        assert_eq!(same.get("cookie").unwrap(), "session=1");
+        assert_eq!(same.get("authorization").unwrap(), "Bearer t");
+        for target in [
+            "https://cdn.example/file.zip",       // another host
+            "http://site.example/file.zip",       // https → http downgrade
+            "https://site.example:8443/file.zip", // another port
+            "https://evil.site.example/file.zip", // a subdomain is another origin
+        ] {
+            let scoped = scoped_headers(&h, &origin, &url(target));
+            assert!(scoped.get("cookie").is_none() && scoped.get("authorization").is_none(), "{target}");
+            assert_eq!(scoped.get("referer").unwrap(), "https://site.example/", "{target}");
+        }
     }
 
     #[test]

@@ -105,10 +105,76 @@ pub fn set_sparse(file: &File, sparse: bool) {
 #[cfg(unix)]
 pub fn set_sparse(_file: &File, _sparse: bool) {}
 
+/// Mark a downloaded file as coming from the internet by writing the
+/// `Zone.Identifier` stream browsers write, so SmartScreen, Office Protected
+/// View and the macro block treat it like any other download. Write it on the
+/// `.part` file before the final rename; the stream moves with the file.
+///
+/// `user:password@` and `#fragment` are stripped from both URLs, and a URL
+/// that isn't http(s) is recorded as `about:internet`, as browsers do for
+/// `blob:` and `data:` downloads. Volumes without alternate data streams
+/// (FAT32, exFAT, some network shares) return an error the caller can ignore.
+#[cfg(windows)]
+pub fn mark_from_internet(path: &Path, host_url: &str, referrer: Option<&str>) -> io::Result<()> {
+    let mut text = String::from("[ZoneTransfer]\r\nZoneId=3\r\n");
+    if let Some(r) = referrer.and_then(zone_url) {
+        text.push_str(&format!("ReferrerUrl={r}\r\n"));
+    }
+    text.push_str(&format!("HostUrl={}\r\n", zone_url(host_url).unwrap_or_else(|| "about:internet".into())));
+    let mut stream = path.as_os_str().to_owned();
+    stream.push(":Zone.Identifier");
+    std::fs::write(Path::new(&stream), text)
+}
+
+/// Other platforms have no equivalent the OS acts on.
+#[cfg(not(windows))]
+pub fn mark_from_internet(_path: &Path, _host_url: &str, _referrer: Option<&str>) -> io::Result<()> {
+    Ok(())
+}
+
+/// An http(s) URL without credentials or fragment, as recorded in the zone
+/// stream. The URL parser has already dropped CR, LF and tabs.
+#[cfg(windows)]
+fn zone_url(url: &str) -> Option<String> {
+    let mut u = reqwest::Url::parse(url.trim()).ok()?;
+    if !matches!(u.scheme(), "http" | "https") {
+        return None;
+    }
+    let _ = u.set_username("");
+    let _ = u.set_password(None);
+    u.set_fragment(None);
+    Some(u.into())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::io::Read;
+
+    #[cfg(windows)]
+    #[test]
+    fn zone_identifier_marks_the_file_without_credentials() {
+        let dir = std::env::temp_dir().join(format!("spate-motw-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("setup.exe.part");
+        std::fs::write(&path, b"MZ").unwrap();
+        mark_from_internet(&path, "https://user:secret@dl.example.com/setup.exe?x=1#frag", Some("https://example.com/page#top"))
+            .unwrap();
+        // The stream survives the rename that completes a download.
+        let done = dir.join("setup.exe");
+        std::fs::rename(&path, &done).unwrap();
+        let zone = std::fs::read_to_string(format!("{}:Zone.Identifier", done.display())).unwrap();
+        assert_eq!(
+            zone,
+            "[ZoneTransfer]\r\nZoneId=3\r\nReferrerUrl=https://example.com/page\r\nHostUrl=https://dl.example.com/setup.exe?x=1\r\n"
+        );
+        assert!(!zone.contains("secret"));
+
+        mark_from_internet(&done, "blob:https://example.com/uuid", None).unwrap();
+        let zone = std::fs::read_to_string(format!("{}:Zone.Identifier", done.display())).unwrap();
+        assert!(zone.ends_with("HostUrl=about:internet\r\n"), "{zone}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     #[test]
     fn positional_writes_land_at_offsets() {
