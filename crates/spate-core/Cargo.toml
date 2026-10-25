@@ -1,6 +1,6 @@
 [package]
 name = "spate-core"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 description = "Spate download engine, manager, persistence and IPC"
 license = "MIT"

@@ -4,7 +4,9 @@ All notable changes to Spate are listed here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
 [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.2.0] - 2026-10-25
+
+Spate can now update itself. Version 0.1.0 can't, so install this one by hand: quit Spate, then copy the files from the new zip over the old ones (close your browser too if Windows says `spate-cli.exe` is in use). Keeping the same folder keeps browser integration and start at sign-in working; your download list and settings carry over either way.
 
 ### Added
 
@@ -46,5 +48,5 @@ Hardening from a security review before the first release:
 - Browser extension: only the cookies the browser itself would send (SameSite rules), strict-origin-when-cross-origin Referer, no HLS detection or dangerous file names from page-supplied `download` attributes, and media in other sites' frames isn't picked automatically.
 - Release workflow: actions pinned to commit SHAs, a read-only build job, and build provenance attestations for public releases.
 
-[Unreleased]: https://github.com/VinZie/spate/compare/v0.1.0...HEAD
+[0.2.0]: https://github.com/VinZie/spate/releases/tag/v0.2.0
 [0.1.0]: https://github.com/VinZie/spate/releases/tag/v0.1.0

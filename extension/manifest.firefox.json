@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "Spate Browser Integration",
   "short_name": "Spate",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Send browser downloads, page links and detected video/audio streams to the Spate download manager.",
   "browser_specific_settings": {
     "gecko": {

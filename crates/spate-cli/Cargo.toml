@@ -1,13 +1,13 @@
 [package]
 name = "spate-cli"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 description = "Spate command line: downloads, app control and browser native-messaging host"
 license = "MIT"
 
 [dependencies]
 clap = { version = "4.6.7", features = ["derive"] }
-spate-core = { version = "0.1.0", path = "../spate-core" }
+spate-core = { version = "0.2.0", path = "../spate-core" }
 reqwest = { version = "0.13.5", default-features = false }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"

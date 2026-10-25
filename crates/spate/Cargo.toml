@@ -1,6 +1,6 @@
 [package]
 name = "spate"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 description = "Spate desktop download manager"
 license = "MIT"
@@ -10,7 +10,7 @@ arboard = { version = "3.7.0", default-features = false }
 chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"] }
 eframe = { version = "0.37.0", default-features = false, features = ["default_fonts", "glow", "persistence", "accesskit", "clipboard", "links", "wayland", "x11"] }
 egui_extras = { version = "0.37.0", default-features = false }
-spate-core = { version = "0.1.0", path = "../spate-core" }
+spate-core = { version = "0.2.0", path = "../spate-core" }
 reqwest = { version = "0.13.5", default-features = false }
 rfd = "0.17.2"
 serde = { version = "1.0.229", features = ["derive"] }

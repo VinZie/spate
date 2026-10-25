@@ -3651,7 +3651,7 @@ dependencies = [
 
 [[package]]
 name = "spate"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "arboard",
  "chrono",
@@ -3669,7 +3669,7 @@ dependencies = [
 
 [[package]]
 name = "spate-cli"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "clap",
  "embed-resource",
@@ -3686,7 +3686,7 @@ dependencies = [
 
 [[package]]
 name = "spate-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "aes",
  "bytes",
