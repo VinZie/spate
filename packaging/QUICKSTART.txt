@@ -42,6 +42,14 @@ Terminal use
 
   Ctrl+C pauses a "get"; run the same command again to resume.
 
+Updates
+  Spate checks GitHub once a day for a new version and asks before
+  installing it. "Update now" replaces the files in this folder and
+  restarts Spate; your downloads continue afterwards. Help -> Check for
+  updates... looks right away; Options -> General turns the daily check off.
+  If Spate cannot write to this folder (for example under Program Files),
+  it offers the download page instead.
+
 Where Spate keeps its data
   %LOCALAPPDATA%\Spate (download list, settings). Set the SPATE_DATA_DIR
   environment variable to use another folder.

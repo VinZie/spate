@@ -1,10 +1,14 @@
 //! Modal dialogs: add URL / captured download, batch add, delete
-//! confirmation, options and about.
+//! confirmation, options, update and about.
 
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{Receiver, TryRecvError};
 use std::time::{Duration, Instant};
 
 use eframe::egui::{self, Align, Color32, Id, Layout, RichText, vec2};
+use spate_core::http::NetConfig;
 use spate_core::ipc::AddItem;
 use spate_core::manager::is_credential_header;
 use spate_core::naming;
@@ -12,6 +16,7 @@ use spate_core::settings::Schedule;
 use spate_core::{AddRequest, Category, DownloadKind, ItemView, Manager, ProbeInfo, Settings, StartMode};
 
 use crate::theme::{self, ThemeChoice};
+use crate::update::{self, Check, Progress, Release};
 use crate::{format, icons, sys, urls};
 
 /// Frame for every modal dialog.
@@ -1034,6 +1039,10 @@ impl OptionsDialog {
                 ui.radio_value(&mut self.ui_draft.theme, t, t.label());
             }
         });
+
+        section(ui, "Updates");
+        ui.checkbox(&mut self.draft.check_for_updates, "Check for a new version of Spate once a day");
+        ui.weak("Spate reads the version number on GitHub and asks before installing anything. Help > Check for updates looks right away.");
     }
 
     fn connection(&mut self, ui: &mut egui::Ui) {
@@ -1206,6 +1215,271 @@ fn time_edit(ui: &mut egui::Ui, id: &str, t: &mut (u8, u8)) {
     });
 }
 
+// ---------------------------------------------------------------------------
+// Update
+// ---------------------------------------------------------------------------
+
+const UPDATE_STOPPED: &str = "The update stopped unexpectedly.";
+
+enum UpdateStage {
+    Checking(Receiver<Result<Check, String>>),
+    UpToDate,
+    /// Main is at this newer version, whose download is not published yet.
+    Unreleased(String),
+    CheckFailed(String),
+    Offer {
+        release: Release,
+        /// The folder to install into, or why this copy cannot update itself.
+        target: Result<PathBuf, String>,
+    },
+    Installing { release: Release, rx: Receiver<Progress>, done: u64, total: Option<u64>, unpacking: bool },
+    Failed { release: Release, error: String },
+}
+
+fn offer_stage(release: Release) -> UpdateStage {
+    UpdateStage::Offer { target: update::install_dir(), release }
+}
+
+/// What the user decided in an [`UpdateDialog`].
+pub enum UpdateOutcome {
+    /// Do not offer this version again.
+    Skip(String),
+    /// The update is in place; restart into this executable.
+    Restart(PathBuf),
+}
+
+enum UpdateAction {
+    Install,
+    Retry,
+}
+
+pub struct UpdateDialog {
+    stage: UpdateStage,
+    net: NetConfig,
+    cancel: Arc<AtomicBool>,
+    gate: Option<ConfirmGate>,
+}
+
+impl UpdateDialog {
+    /// Check now and show the answer (Help > Check for updates).
+    pub fn check(net: NetConfig, ctx: &egui::Context) -> Self {
+        let rx = update::spawn_check(net.clone(), ctx.clone());
+        Self { stage: UpdateStage::Checking(rx), net, cancel: Arc::default(), gate: None }
+    }
+
+    /// Offer `release`, which the daily check found. Like other dialogs that
+    /// open by themselves, its buttons wait a moment before they work.
+    pub fn offer(release: Release, net: NetConfig) -> Self {
+        Self { stage: offer_stage(release), net, cancel: Arc::default(), gate: Some(ConfirmGate::default()) }
+    }
+
+    /// Take in what the check or the install reported. The executable to
+    /// restart into once the update is in place.
+    fn poll(&mut self) -> Option<PathBuf> {
+        let next = match &mut self.stage {
+            UpdateStage::Checking(rx) => match rx.try_recv() {
+                Err(TryRecvError::Empty) => None,
+                Ok(Ok(Check::UpToDate)) => Some(UpdateStage::UpToDate),
+                Ok(Ok(Check::Unreleased(version))) => Some(UpdateStage::Unreleased(version)),
+                Ok(Ok(Check::Available(release))) => Some(offer_stage(release)),
+                Ok(Err(e)) => Some(UpdateStage::CheckFailed(e)),
+                Err(TryRecvError::Disconnected) => Some(UpdateStage::CheckFailed(UPDATE_STOPPED.into())),
+            },
+            UpdateStage::Installing { release, rx, done, total, unpacking } => loop {
+                match rx.try_recv() {
+                    Ok(Progress::Downloading { done: d, total: t }) => {
+                        *done = d;
+                        *total = t;
+                    }
+                    Ok(Progress::Installing) => *unpacking = true,
+                    Ok(Progress::Finished(Ok(exe))) => return Some(exe),
+                    Ok(Progress::Finished(Err(error))) => break Some(UpdateStage::Failed { release: release.clone(), error }),
+                    Err(TryRecvError::Empty) => break None,
+                    Err(TryRecvError::Disconnected) => break Some(UpdateStage::Failed { release: release.clone(), error: UPDATE_STOPPED.into() }),
+                }
+            },
+            _ => None,
+        };
+        if let Some(stage) = next {
+            self.stage = stage;
+        }
+        None
+    }
+
+    /// `active` is the number of running downloads, which the restart pauses.
+    pub fn show(&mut self, ctx: &egui::Context, active: usize) -> DialogResult<UpdateOutcome> {
+        if let Some(exe) = self.poll() {
+            return DialogResult::Done(UpdateOutcome::Restart(exe));
+        }
+        let armed = gate_open(&mut self.gate, ctx);
+        let mut result = DialogResult::Open;
+        let mut action = None;
+        let modal = egui::Modal::new(Id::unique("update_dialog")).frame(dialog_frame(ctx)).show(ctx, |ui| {
+            ui.set_width(480.0);
+            // Button rows are one row high, so the dialog shrinks when a
+            // stage with less to show follows a taller one.
+            let buttons = |ui: &mut egui::Ui, add: &mut dyn FnMut(&mut egui::Ui)| {
+                ui.add_space(10.0);
+                ui.horizontal(|ui| ui.with_layout(Layout::right_to_left(Align::Center), |ui| add(ui)));
+            };
+            let close = |ui: &mut egui::Ui, result: &mut DialogResult<UpdateOutcome>| {
+                buttons(ui, &mut |ui| {
+                    if ui.add(primary_button("Close")).clicked() {
+                        *result = DialogResult::Cancel;
+                    }
+                });
+            };
+            match &self.stage {
+                UpdateStage::Checking(_) => {
+                    title(ui, "Checking for updates");
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label("Looking up the latest version on GitHub…");
+                    });
+                    close(ui, &mut result);
+                }
+                UpdateStage::UpToDate => {
+                    title(ui, "Spate is up to date");
+                    ui.label(format!("Version {} is the latest.", update::CURRENT));
+                    close(ui, &mut result);
+                }
+                UpdateStage::Unreleased(version) => {
+                    title(ui, "Spate is up to date");
+                    ui.label(format!("You have version {}. Version {version} is on its way and is offered here once its download is published.", update::CURRENT));
+                    close(ui, &mut result);
+                }
+                UpdateStage::CheckFailed(error) => {
+                    title(ui, "Could not check for updates");
+                    ui.colored_label(theme::BAD, error);
+                    close(ui, &mut result);
+                }
+                UpdateStage::Offer { release, target } => {
+                    title(ui, &format!("Spate {} is available", release.version));
+                    ui.weak(format!("You have version {}.", update::CURRENT));
+                    release_notes(ui, &release.notes);
+                    ui.add_space(6.0);
+                    match target {
+                        Ok(_) if active == 1 => {
+                            ui.colored_label(theme::WARN, "The running download pauses while Spate restarts, then continues.");
+                        }
+                        Ok(_) if active > 1 => {
+                            ui.colored_label(theme::WARN, format!("The {active} running downloads pause while Spate restarts, then continue."));
+                        }
+                        Ok(_) => {}
+                        Err(why) => {
+                            ui.weak(format!("{why} Download the new version from its release page instead."));
+                        }
+                    }
+                    ui.add_space(10.0);
+                    ui.horizontal(|ui| {
+                        let skip = ui.add_enabled(armed, secondary_button("Skip this version")).on_disabled_hover_text(WAIT_HINT);
+                        if skip.clicked() {
+                            result = DialogResult::Done(UpdateOutcome::Skip(release.version.clone()));
+                        }
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            if target.is_ok() {
+                                if ui.add_enabled(armed, primary_button("Update now")).on_disabled_hover_text(WAIT_HINT).clicked() {
+                                    action = Some(UpdateAction::Install);
+                                }
+                            } else if ui.add(primary_button("Open download page")).clicked() {
+                                ui.ctx().open_url(egui::OpenUrl::new_tab(update::release_page(&release.version)));
+                                result = DialogResult::Cancel;
+                            }
+                            if ui.add(secondary_button("Later")).clicked() {
+                                result = DialogResult::Cancel;
+                            }
+                        });
+                    });
+                }
+                UpdateStage::Installing { release, done, total, unpacking, .. } => {
+                    title(ui, &format!("Updating to Spate {}", release.version));
+                    let bar = if *unpacking {
+                        egui::ProgressBar::new(1.0).text("Installing…")
+                    } else {
+                        let fraction = total.filter(|t| *t > 0).map_or(0.0, |t| *done as f32 / t as f32);
+                        let text = match total {
+                            Some(t) => format!("Downloading {} of {}", format::size(*done), format::size(*t)),
+                            None => format!("Downloading {}", format::size(*done)),
+                        };
+                        egui::ProgressBar::new(fraction).text(text)
+                    };
+                    ui.add(bar);
+                    ui.weak("Spate restarts once the new version is in place.");
+                    buttons(ui, &mut |ui| {
+                        if ui.add_enabled(!*unpacking, secondary_button("Cancel")).clicked() {
+                            self.cancel.store(true, Ordering::Relaxed);
+                            result = DialogResult::Cancel;
+                        }
+                    });
+                }
+                UpdateStage::Failed { release, error } => {
+                    title(ui, "The update did not finish");
+                    ui.colored_label(theme::BAD, error);
+                    ui.label(format!("Spate {} is still installed.", update::CURRENT));
+                    buttons(ui, &mut |ui| {
+                        if ui.add(primary_button("Try again")).clicked() {
+                            action = Some(UpdateAction::Retry);
+                        }
+                        if ui.add(secondary_button("Open download page")).clicked() {
+                            ui.ctx().open_url(egui::OpenUrl::new_tab(update::release_page(&release.version)));
+                            result = DialogResult::Cancel;
+                        }
+                        if ui.add(secondary_button("Close")).clicked() {
+                            result = DialogResult::Cancel;
+                        }
+                    });
+                }
+            }
+        });
+
+        let next = match (action, &self.stage) {
+            (Some(UpdateAction::Install), UpdateStage::Offer { release, target: Ok(dir) }) => {
+                self.cancel = Arc::default();
+                let rx = update::spawn_install(release.clone(), dir.clone(), self.net.clone(), self.cancel.clone(), ctx.clone());
+                Some(UpdateStage::Installing { release: release.clone(), rx, done: 0, total: None, unpacking: false })
+            }
+            (Some(UpdateAction::Retry), UpdateStage::Failed { release, .. }) => Some(offer_stage(release.clone())),
+            _ => None,
+        };
+        if let Some(stage) = next {
+            self.stage = stage;
+        }
+        let installing = matches!(self.stage, UpdateStage::Installing { .. });
+        if modal.should_close() && matches!(result, DialogResult::Open) && !installing && ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            result = DialogResult::Cancel;
+        }
+        result
+    }
+}
+
+/// A release's section of the changelog, lightly formatted.
+fn release_notes(ui: &mut egui::Ui, notes: &str) {
+    if notes.is_empty() {
+        return;
+    }
+    ui.add_space(8.0);
+    ui.label(RichText::new("What's new").strong());
+    egui::Frame::group(ui.style()).fill(ui.visuals().extreme_bg_color).show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        egui::ScrollArea::vertical().max_height(220.0).show(ui, |ui| {
+            for line in notes.lines() {
+                let line = line.trim().replace(['`', '*'], "");
+                if let Some(heading) = line.strip_prefix("### ") {
+                    ui.add_space(4.0);
+                    ui.label(RichText::new(heading).strong());
+                } else if let Some(item) = line.strip_prefix("- ") {
+                    ui.horizontal_top(|ui| {
+                        ui.label("•");
+                        ui.add(egui::Label::new(item).wrap());
+                    });
+                } else if !line.is_empty() {
+                    ui.add(egui::Label::new(line).wrap());
+                }
+            }
+        });
+    });
+}
+
 pub fn about_contents(ui: &mut egui::Ui) {
     ui.add_space(8.0);
     ui.horizontal(|ui| {
@@ -1213,7 +1487,7 @@ pub fn about_contents(ui: &mut egui::Ui) {
         crate::app::paint_logo(ui.painter(), rect);
         ui.vertical(|ui| {
             ui.label(RichText::new("Spate").heading().strong());
-            ui.label(format!("Version {}", env!("CARGO_PKG_VERSION")));
+            ui.label(format!("Version {}", update::CURRENT));
             ui.weak("Open-source download manager");
         });
     });
@@ -1228,7 +1502,7 @@ pub fn about_contents(ui: &mut egui::Ui) {
             let _ = sys::open_path(&dir);
         }
     });
-    ui.hyperlink_to("Project page", "https://github.com/spate/spate");
+    ui.hyperlink_to("Project page", update::PROJECT_URL);
 }
 
 pub struct AboutDialog;

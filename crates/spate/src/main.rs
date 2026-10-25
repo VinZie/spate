@@ -12,10 +12,13 @@ mod segmap;
 mod sys;
 mod theme;
 mod tray;
+mod update;
 mod urls;
 
+use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::{Arc, OnceLock, mpsc};
+use std::time::Duration;
 
 use eframe::egui;
 use spate_core::ipc::{self, AddItem, Request, Response};
@@ -45,11 +48,19 @@ fn main() -> ExitCode {
         };
     }
 
+    // Files an earlier update replaced; the version that ran from them may
+    // take a moment to exit after starting this one.
+    let _ = std::thread::Builder::new().name("spate-cleanup".into()).spawn(|| {
+        std::thread::sleep(Duration::from_secs(10));
+        update::clean_up();
+    });
+
     let rt = match tokio::runtime::Builder::new_multi_thread().enable_all().thread_name("spate-rt").build() {
         Ok(rt) => rt,
         Err(e) => return fail(&format!("Could not start the async runtime: {e}")),
     };
-    let manager = match Manager::new(rt.handle().clone(), data_dir.clone()) {
+    let open = if args.updated { Manager::new_resuming } else { Manager::new };
+    let manager = match open(rt.handle().clone(), data_dir.clone()) {
         Ok(m) => m,
         Err(e) => return fail(&format!("Could not load the download list from {}:\n{e}", data_dir.display())),
     };
@@ -112,14 +123,14 @@ fn main() -> ExitCode {
     };
 
     let m = manager.clone();
-    let urls = args.urls.clone();
-    let background = args.background;
+    let restart: Arc<OnceLock<PathBuf>> = Arc::new(OnceLock::new());
+    let app_restart = restart.clone();
     let result = eframe::run_native(
         "Spate",
         options,
         Box::new(move |cc| {
             let _ = ctx_cell.set(cc.egui_ctx.clone());
-            Ok(Box::new(App::new(cc, m, rx, tx, urls, background)))
+            Ok(Box::new(App::new(cc, m, rx, tx, args, app_restart)))
         }),
     );
 
@@ -127,7 +138,15 @@ fn main() -> ExitCode {
     // a fresh instance instead of talking to this one.
     drop(server);
     manager.shutdown();
-    rt.shutdown_timeout(std::time::Duration::from_secs(3));
+    rt.shutdown_timeout(Duration::from_secs(3));
+
+    // An installed update starts once the list is saved and this instance
+    // no longer answers, so it does not hand itself over to us.
+    if let Some(exe) = restart.get()
+        && let Err(e) = std::process::Command::new(exe).arg(urls::UPDATED_FLAG).spawn()
+    {
+        return fail(&format!("Spate was updated, but the new version could not be started: {e}\nStart {} again.", exe.display()));
+    }
 
     match result {
         Ok(()) => ExitCode::SUCCESS,

@@ -34,6 +34,10 @@ pub struct Settings {
     pub resume_on_launch: bool,
     pub notify_on_complete: bool,
     pub schedule: Schedule,
+    /// Look for a new version once a day.
+    pub check_for_updates: bool,
+    /// A version the user chose to skip; it is not offered again.
+    pub skipped_version: Option<String>,
 }
 
 /// Daily window during which the queue runs automatically.
@@ -64,6 +68,8 @@ impl Default for Settings {
             resume_on_launch: false,
             notify_on_complete: true,
             schedule: Schedule::default(),
+            check_for_updates: true,
+            skipped_version: None,
         }
     }
 }

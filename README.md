@@ -52,6 +52,8 @@ Spate splits each download across several connections, keeps every connection bu
 2. Unzip it somewhere it can stay, for example `%LOCALAPPDATA%\Programs\Spate`.
 3. Run `spate.exe`. If SmartScreen says "Windows protected your PC", choose **More info → Run anyway**.
 
+Spate checks once a day for a new version and asks before installing it. **Update now** downloads the release zip, checks it against the published SHA-256, swaps the files and restarts, and running downloads continue afterwards. **Help → Check for updates…** looks right away; **Options → General** turns the daily check off.
+
 ### Add downloads
 
 - Click **Add URL** (Ctrl+N). Spate checks the file's name, size and resume support before you start.
@@ -124,7 +126,7 @@ Measured in October 2026 on one Windows 11 PC with the release build. More conne
 | **Engine** | HTTP and HTTPS (rustls, HTTP/2) · 1–32 connections · pause and resume with crash-safe checkpoints · automatic restart when the remote file changes · retries with backoff and stall detection · adaptive connection limits · global and per-download speed limits · SHA-256 verification · file names from `Content-Disposition` (RFC 6266 and 5987), made safe for Windows |
 | **Streaming video** | HLS (`.m3u8`): picks a variant from the master playlist, AES-128 decryption, fMP4 with `EXT-X-MAP`, byte-range segments, segments fetched in parallel |
 | **Organising** | Persistent download list · a queue that runs *N at a time* · daily start and stop times · automatic retries for queued items · categories with their own folders (Compressed, Documents, Music, Programs, Video, General) |
-| **Desktop app** | Sortable download table with category and state filters · live segment map with per-connection speeds · Add URL, Batch and browser-capture dialogs · clipboard watcher · tray icon · in-app notices · start at sign-in · light and dark themes |
+| **Desktop app** | Sortable download table with category and state filters · live segment map with per-connection speeds · Add URL, Batch and browser-capture dialogs · clipboard watcher · tray icon · in-app notices · start at sign-in · light and dark themes · update prompt that installs the new version in place |
 | **Command line** | `get` with resume · `info` · `bench` · `add` / `show` · `status` · Windows-style switches · the browser's native-messaging host with `install-host` / `uninstall-host` |
 | **Browser extension** | Chrome, Edge, Brave and Firefox (Manifest V3) · download capture that falls back to the browser if Spate isn't running · context menus for a link, media, all links or selected links · media and HLS detection with a popup list · file-type, minimum-size and excluded-site options |
 
@@ -138,7 +140,8 @@ Measured in October 2026 on one Windows 11 PC with the release build. More conne
 - **No surprise clicks.** A captured download never steals focus: the taskbar button flashes instead. Its Start button waits about a second, held keys are ignored, and Enter only opens a download you picked yourself. The name you confirm is the name that's saved.
 - **Careful with files.** File names are cleaned of reserved device names, bidirectional-text tricks and invisible characters. A partial file carries a random token, so Spate never resumes into or deletes a file it didn't create, and a file that fails its checksum never gets its final name.
 - **Least privilege.** Everything runs as your user. Browser registration writes only under `HKCU`, and the extension asks for the minimum permissions, each explained in [`extension/README.md`](extension/README.md).
-- **No telemetry.** Spate only connects to the servers you download from.
+- **Updates only when you say so.** An update is installed only after you click **Update now**, only from this project's GitHub releases over HTTPS, and only if the package matches the SHA-256 published with it. If anything fails, the files already replaced are put back.
+- **No telemetry.** Spate connects to the servers you download from and, once a day, to GitHub to read the latest version number (**Options → General** turns this off). Nothing about you or your downloads is sent.
 
 Found a vulnerability? Please report it privately as described in [`SECURITY.md`](SECURITY.md).
 

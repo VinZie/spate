@@ -4,6 +4,16 @@ All notable changes to Spate are listed here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- Update prompt. Once a day Spate compares its version with the one on the `main` branch and, once that version's release is published, offers to install it with its release notes. **Update now** downloads the package, checks it against the published SHA-256, swaps the files in place and restarts; downloads that were running continue afterwards. **Help → Check for updates…** looks right away, and **Options → General** turns the daily check off.
+
+### Fixed
+
+- **Help → About → Project page** opened the wrong address.
+
 ## [0.1.0] - 2026-10-24
 
 First public release.
@@ -36,4 +46,5 @@ Hardening from a security review before the first release:
 - Browser extension: only the cookies the browser itself would send (SameSite rules), strict-origin-when-cross-origin Referer, no HLS detection or dangerous file names from page-supplied `download` attributes, and media in other sites' frames isn't picked automatically.
 - Release workflow: actions pinned to commit SHAs, a read-only build job, and build provenance attestations for public releases.
 
+[Unreleased]: https://github.com/VinZie/spate/compare/v0.1.0...HEAD
 [0.1.0]: https://github.com/VinZie/spate/releases/tag/v0.1.0

@@ -368,6 +368,17 @@ impl Manager {
     /// Queue members that were active go back to `Queued` instead, so the
     /// queue continues them.
     pub fn new(rt: tokio::runtime::Handle, data_dir: PathBuf) -> Result<Self> {
+        Self::open(rt, data_dir, false)
+    }
+
+    /// Like [`Manager::new`], but resumes the downloads the previous run left
+    /// active even when `resume_on_launch` is off: for the restart after an
+    /// update, which interrupted them.
+    pub fn new_resuming(rt: tokio::runtime::Handle, data_dir: PathBuf) -> Result<Self> {
+        Self::open(rt, data_dir, true)
+    }
+
+    fn open(rt: tokio::runtime::Handle, data_dir: PathBuf, resume: bool) -> Result<Self> {
         std::fs::create_dir_all(&data_dir)?;
         let settings = Settings::load(&data_dir);
         let mut records = load_records(&data_dir);
@@ -386,7 +397,7 @@ impl Manager {
                 converted = true;
             }
             if rec.status.is_active() {
-                if settings.resume_on_launch {
+                if resume || settings.resume_on_launch {
                     resume_now.push((rec.id, rec.queued));
                 }
                 rec.status = if rec.queued { Status::Queued } else { Status::Paused };
@@ -1919,6 +1930,30 @@ mod tests {
         drop(m);
         let m = manager(&env);
         assert!(m.add(request(format!("{}/d.bin", srv.base), StartMode::Paused)) > newest);
+        m.shutdown();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn restart_after_update_resumes_interrupted_downloads() {
+        let env = env("update-restart", |s| s.resume_on_launch = false);
+        let srv = serve(4 * MIB, Some(MIB)).await;
+        let (active, parked) = {
+            let m = manager(&env);
+            let active = m.add(AddRequest { connections: Some(2), ..request(format!("{}/a.bin", srv.base), StartMode::Now) });
+            let parked = m.add(request(format!("{}/b.bin", srv.base), StartMode::Paused));
+            wait_for(&m, active, "progress", |v| v.downloaded >= 256 * KIB as u64).await;
+            let gui = m.clone();
+            tokio::task::spawn_blocking(move || std::thread::spawn(move || gui.shutdown()).join().unwrap())
+                .await
+                .unwrap();
+            (active, parked)
+        };
+
+        let m = Manager::new_resuming(tokio::runtime::Handle::current(), env.data.clone()).unwrap();
+        assert!(m.item(active).unwrap().status.is_active(), "the update interrupted it, so it continues");
+        assert_eq!(m.item(parked).unwrap().status, Status::Paused, "what the user paused stays paused");
+        let a = wait_for(&m, active, "completion", |v| v.status == Status::Completed).await;
+        assert_eq!(download::sha256_file(a.file_path.as_ref().unwrap()).unwrap(), srv.sha);
         m.shutdown();
     }
 

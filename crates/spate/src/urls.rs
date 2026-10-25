@@ -138,12 +138,17 @@ fn single_letter(s: &str) -> Option<char> {
     (it.next().is_none() && c.is_ascii_alphabetic()).then_some(c)
 }
 
+/// Passed by the previous version when it restarts into an update.
+pub const UPDATED_FLAG: &str = "--updated";
+
 /// Parsed command line of the desktop app.
 #[derive(Debug, Default, PartialEq)]
 pub struct Args {
     pub urls: Vec<String>,
     /// Start minimised / in the tray (used when launched by a helper).
     pub background: bool,
+    /// Started by the previous version after it installed an update.
+    pub updated: bool,
 }
 
 pub fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Args {
@@ -151,6 +156,7 @@ pub fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Args {
     for a in args {
         match a.as_str() {
             "--background" | "--minimized" | "--tray" | "-b" => out.background = true,
+            UPDATED_FLAG => out.updated = true,
             s if is_http_url(s) => out.urls.push(s.to_string()),
             _ => {}
         }
@@ -222,8 +228,9 @@ mod tests {
     #[test]
     fn command_line() {
         let a = parse_args(["--background".to_string(), "https://x/y.zip".into(), "chrome-extension://abc/".into()]);
-        assert!(a.background);
+        assert!(a.background && !a.updated);
         assert_eq!(a.urls, vec!["https://x/y.zip"]);
         assert_eq!(parse_args(Vec::<String>::new()), Args::default());
+        assert!(parse_args([UPDATED_FLAG.to_string()]).updated);
     }
 }

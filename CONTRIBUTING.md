@@ -61,8 +61,10 @@ docs/assets/        images used by the README
 ## Releasing
 
 1. Update the version in the three `crates/*/Cargo.toml` files, `extension/manifest.json`, `extension/manifest.firefox.json` and `extension/package.json`.
-2. Add a section to [`CHANGELOG.md`](CHANGELOG.md).
+2. Add a section to [`CHANGELOG.md`](CHANGELOG.md) headed `## [0.2.0] - <date>`. The app's update prompt shows that section as the release notes.
 3. Commit, then tag and push: `git tag v0.2.0 && git push origin v0.2.0`. The release workflow tests, builds the zip and publishes the GitHub release.
+
+Installed copies read the version in `crates/spate/Cargo.toml` on `main` once a day. When it is newer than theirs, they offer it as soon as the release for that tag has its zip and `.sha256` file, so a version bump that reaches `main` before its tag stays quiet until the release is published.
 
 ## License
 

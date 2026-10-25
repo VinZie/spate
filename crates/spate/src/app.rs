@@ -4,6 +4,7 @@
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, Sender};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use eframe::egui::{self, Align, Align2, Color32, CornerRadius, Key, KeyboardShortcut, Layout, Modifiers, RichText, Sense, Stroke, vec2};
@@ -14,11 +15,12 @@ use serde::{Deserialize, Serialize};
 
 use crate::clipwatch::ClipWatcher;
 use crate::dialogs::{
-    AboutDialog, AddDialog, BatchDialog, DeleteDialog, DialogResult, OptionsDialog, OptionsTab, Source, UiOptions, request_from_item,
+    AboutDialog, AddDialog, BatchDialog, DeleteDialog, DialogResult, OptionsDialog, OptionsTab, Source, UiOptions, UpdateDialog, UpdateOutcome,
+    request_from_item,
 };
 use crate::icons::{self, Icon};
 use crate::theme::{self, ThemeChoice};
-use crate::{format, segmap, sys, urls};
+use crate::{format, segmap, sys, update, urls};
 
 /// Events delivered to the UI thread from other threads.
 pub enum UiEvent {
@@ -26,6 +28,8 @@ pub enum UiEvent {
     Completed(u64, PathBuf),
     ClipboardUrl(String),
     HostInstalled(Result<String, String>),
+    /// The daily check found a newer release.
+    UpdateAvailable(update::Release),
     #[allow(dead_code)]
     Tray(TrayAction),
 }
@@ -238,6 +242,10 @@ pub struct App {
     batch: Option<BatchDialog>,
     delete: Option<DeleteDialog>,
     options: Option<OptionsDialog>,
+    update: Option<UpdateDialog>,
+    /// Set to the new executable once an update is installed; `main` starts
+    /// it after this instance has shut down.
+    restart: Arc<OnceLock<PathBuf>>,
     about: bool,
     shortcuts: bool,
     toasts: Vec<Toast>,
@@ -259,8 +267,8 @@ impl App {
         m: Manager,
         rx: Receiver<UiEvent>,
         tx: Sender<UiEvent>,
-        initial_urls: Vec<String>,
-        background: bool,
+        args: urls::Args,
+        restart: Arc<OnceLock<PathBuf>>,
     ) -> Self {
         let ctx = cc.egui_ctx.clone();
         theme::install(&ctx);
@@ -272,6 +280,7 @@ impl App {
         clip.set_enabled(settings.clipboard_monitor);
 
         let tray = crate::tray::Tray::new(&ctx, tx.clone());
+        update::spawn_daily_check(m.clone(), tx.clone(), ctx.clone());
 
         let mut app = Self {
             m,
@@ -293,6 +302,8 @@ impl App {
             batch: None,
             delete: None,
             options: None,
+            update: None,
+            restart,
             about: false,
             shortcuts: false,
             toasts: Vec::new(),
@@ -301,14 +312,17 @@ impl App {
             clip,
             when_done: WhenDone::Nothing,
             was_busy: false,
-            background_start: background,
+            background_start: args.background,
             first_frame: true,
             tray,
             hidden_to_tray: false,
             window_focused: true,
         };
-        if !initial_urls.is_empty() {
-            let items = initial_urls.into_iter().map(|url| AddItem { url, ..Default::default() }).collect();
+        if args.updated {
+            app.toast(ToastKind::Info, "Spate updated", format!("You now have version {}.", update::CURRENT), 8);
+        }
+        if !args.urls.is_empty() {
+            let items = args.urls.into_iter().map(|url| AddItem { url, ..Default::default() }).collect();
             app.handle_add(&ctx, items, true, StartMode::Now);
         }
         app
@@ -337,6 +351,13 @@ impl App {
                     if let Some(o) = &mut self.options {
                         o.host_running = false;
                         o.host_output = Some(r);
+                    }
+                }
+                UiEvent::UpdateAvailable(release) => {
+                    // Shown once no other dialog is open (see `dialogs`).
+                    let skipped = self.settings.skipped_version.as_deref() == Some(release.version.as_str());
+                    if self.update.is_none() && self.settings.check_for_updates && !skipped {
+                        self.update = Some(UpdateDialog::offer(release, self.settings.net.clone()));
                     }
                 }
                 UiEvent::Tray(a) => match a {
@@ -717,7 +738,14 @@ impl App {
     }
 
     fn any_modal(&self) -> bool {
-        self.add_dialog.is_some() || !self.captures.is_empty() || self.batch.is_some() || self.delete.is_some() || self.options.is_some() || self.about || self.shortcuts
+        self.add_dialog.is_some()
+            || !self.captures.is_empty()
+            || self.batch.is_some()
+            || self.delete.is_some()
+            || self.options.is_some()
+            || self.update.is_some()
+            || self.about
+            || self.shortcuts
     }
 
     // -----------------------------------------------------------------------
@@ -858,6 +886,9 @@ impl App {
                     let _ = sys::open_path(&spate_core::paths::data_dir());
                 }
                 ui.separator();
+                if ui.add_enabled(self.update.is_none(), egui::Button::new("Check for updates…")).clicked() {
+                    self.update = Some(UpdateDialog::check(self.settings.net.clone(), ui.ctx()));
+                }
                 if ui.button("About Spate").clicked() {
                     self.about = true;
                 }
@@ -1380,6 +1411,25 @@ impl App {
                         self.toast(ToastKind::Failed, "Could not change sign-in start", e, 6);
                     }
                     self.options = None;
+                }
+            }
+            return;
+        }
+        if let Some(u) = &mut self.update {
+            let active = self.items.iter().filter(|i| i.status.is_active()).count();
+            match u.show(ctx, active) {
+                DialogResult::Open => {}
+                DialogResult::Cancel => self.update = None,
+                DialogResult::Done(UpdateOutcome::Skip(version)) => {
+                    let mut s = self.settings.clone();
+                    s.skipped_version = Some(version);
+                    self.apply_settings(s);
+                    self.update = None;
+                }
+                DialogResult::Done(UpdateOutcome::Restart(exe)) => {
+                    let _ = self.restart.set(exe);
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    self.update = None;
                 }
             }
             return;
